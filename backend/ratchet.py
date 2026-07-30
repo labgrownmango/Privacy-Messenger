@@ -165,7 +165,7 @@ def _decrypt_msg(mk: bytes, ciphertext: bytes, aad: bytes = b"") -> bytes:
 class RatchetState:
     """Mutable Double Ratchet session state. Serialisable to/from JSON for DB storage."""
 
-    __slots__ = ("dhs", "dhr", "rk", "cks", "ckr", "ns", "nr", "pn", "mkskipped")
+    __slots__ = ("dhs", "dhr", "rk", "cks", "ckr", "ns", "nr", "pn", "mkskipped", "ek_a_pk")
 
     def __init__(self):
         self.dhs: Optional[nacl.public.PrivateKey] = None   # our DH ratchet key pair
@@ -177,6 +177,7 @@ class RatchetState:
         self.nr:  int = 0                                    # receiving message counter
         self.pn:  int = 0                                    # previous chain length
         self.mkskipped: Dict[str, bytes] = {}               # {dh_pk_b64:n -> mk}
+        self.ek_a_pk: Optional[str] = None                   # Ephemeral Public Key for initial X3DH header
 
     # ── Serialisation ──────────────────────────────────────────────────────
     def to_json(self) -> str:
@@ -187,7 +188,8 @@ class RatchetState:
             "cks":    b64e(self.cks)         if self.cks else None,
             "ckr":    b64e(self.ckr)         if self.ckr else None,
             "ns": self.ns, "nr": self.nr, "pn": self.pn,
-            "mkskipped": {k: b64e(v) for k, v in self.mkskipped.items()}
+            "mkskipped": {k: b64e(v) for k, v in self.mkskipped.items()},
+            "ek_a_pk": self.ek_a_pk
         })
 
     @classmethod
@@ -203,11 +205,12 @@ class RatchetState:
         st.nr = d.get("nr", 0)
         st.pn = d.get("pn", 0)
         st.mkskipped = {k: b64d(v) for k, v in d.get("mkskipped", {}).items()}
+        st.ek_a_pk = d.get("ek_a_pk")
         return st
 
 
 # ─── Ratchet initialisation ───────────────────────────────────────────────────
-def init_as_sender(shared_secret: bytes, their_dh_pk_b64: str) -> RatchetState:
+def init_as_sender(shared_secret: bytes, their_dh_pk_b64: str, ek_a: Optional[nacl.public.PrivateKey] = None) -> RatchetState:
     """
     Initialise Double Ratchet as the session INITIATOR.
     Caller has already performed X3DH to derive shared_secret.
@@ -217,6 +220,8 @@ def init_as_sender(shared_secret: bytes, their_dh_pk_b64: str) -> RatchetState:
     st.dhs = nacl.public.PrivateKey.generate()
     st.dhr = their_pk
     st.rk, st.cks = kdf_rk(shared_secret, _dh(st.dhs, st.dhr))
+    if ek_a:
+        st.ek_a_pk = b64e(bytes(ek_a.public_key))
     return st
 
 
@@ -237,6 +242,7 @@ def ratchet_encrypt(state: RatchetState, plaintext: str) -> Tuple[dict, str]:
     Encrypt plaintext, advance sending chain.
     Returns (header_dict, ciphertext_b64).
     Pads plaintext before encrypting and binds header as AAD for AEAD integrity.
+    Includes X3DH Ephemeral Key (ek) in header on initial message.
     """
     if state.cks is None:
         raise RuntimeError("Ratchet not ready: sending chain key is None (call init_as_sender first)")
@@ -248,9 +254,19 @@ def ratchet_encrypt(state: RatchetState, plaintext: str) -> Tuple[dict, str]:
         "pn": state.pn,
         "n":  state.ns,
     }
+
+    # Attach Ephemeral Key ek to header on first X3DH message
+    if state.ek_a_pk:
+        header["ek"] = state.ek_a_pk
+        state.ek_a_pk = None # Clear after first transmission
+
     state.ns += 1
 
-    aad = f"{header['dh']}:{header['pn']}:{header['n']}".encode("utf-8")
+    aad_str = f"{header['dh']}:{header['pn']}:{header['n']}"
+    if "ek" in header:
+        aad_str += f":{header['ek']}"
+    aad = aad_str.encode("utf-8")
+
     padded = pad_plaintext(plaintext.encode("utf-8"))
     ct = _encrypt_msg(mk, padded, aad)
 
@@ -269,9 +285,13 @@ def ratchet_decrypt(state: RatchetState, header: dict, ciphertext_b64: str) -> s
     their_dh_pk_b64 = header["dh"]
     pn = header["pn"]
     n  = header["n"]
-    aad = f"{their_dh_pk_b64}:{pn}:{n}".encode("utf-8")
-    their_pk = nacl.public.PublicKey(b64d(their_dh_pk_b64))
 
+    aad_str = f"{their_dh_pk_b64}:{pn}:{n}"
+    if "ek" in header:
+        aad_str += f":{header['ek']}"
+    aad = aad_str.encode("utf-8")
+
+    their_pk = nacl.public.PublicKey(b64d(their_dh_pk_b64))
     ct = b64d(ciphertext_b64)
 
     # 1. Check skipped message keys

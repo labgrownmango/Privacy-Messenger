@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.4 — Hardened Security & Real X3DH")
+app = FastAPI(title="Privacy Messenger v1.0.5 — Full X3DH & Verified Group Signatures")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -168,7 +168,6 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         logger.info(f"[Transport] Attempting direct P2P transmission to {dest_host}:{dest_port}")
         try:
             reader, writer = await connect_tcp_or_socks5(dest_host, dest_port, proxy_enabled, proxy_host, proxy_port)
-            # Post HTTP JSON request to receiver's /messages/receive endpoint
             body = json.dumps(packet_dict).encode("utf-8")
             http_req = (
                 f"POST /messages/receive HTTP/1.1\r\n"
@@ -614,7 +613,7 @@ def api_delete_contact(user_id: str):
     return {"ok": True}
 
 # ─── Double Ratchet Session Management & Real X3DH ────────────────────────────
-def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetState:
+def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_header: Optional[dict] = None) -> RatchetState:
     id_data = get_identity()
     if not id_data: raise ValueError("No local identity")
 
@@ -629,42 +628,43 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetSt
             return RatchetState.from_json(dec_state_json)
 
         my_dh_sk = nacl.public.PrivateKey(b64d(id_data["dh_sk"]))
-        my_sign_sk = nacl.signing.SigningKey(b64d(id_data["sign_sk"]))
         their_dh_pk = nacl.public.PublicKey(b64d(contact["dh_pk"]))
         their_sign_pk = nacl.signing.VerifyKey(b64d(contact["sign_pk"]))
+        ek_a = None
 
         # Check if Signed Prekey (SPK) is available for Real X3DH Protocol
-        if contact["spk_pk"] and contact["spk_sig"]:
+        if is_sender and contact["spk_pk"] and contact["spk_sig"]:
             their_spk_pk = nacl.public.PublicKey(b64d(contact["spk_pk"]))
             their_spk_sig = b64d(contact["spk_sig"])
 
-            if is_sender:
-                shared_secret, ek_a = x3dh_sender_derive(
-                    alice_ik_sk=my_dh_sk,
-                    bob_ik_pk=their_dh_pk,
-                    bob_spk_pk=their_spk_pk,
-                    bob_spk_sig=their_spk_sig,
-                    bob_sign_pk=their_sign_pk
-                )
-            else:
-                my_spk_sk = nacl.public.PrivateKey(b64d(id_data["spk_sk"]))
-                shared_secret = x3dh_receiver_derive(
-                    bob_ik_sk=my_dh_sk,
-                    bob_spk_sk=my_spk_sk,
-                    alice_ik_pk=their_dh_pk,
-                    alice_ek_pk=their_dh_pk # Ephemeral or DH key
-                )
-            logger.info(f"[X3DH] Derived Master Shared Secret via Real X3DH Protocol with {contact_id}")
+            shared_secret, ek_a = x3dh_sender_derive(
+                alice_ik_sk=my_dh_sk,
+                bob_ik_pk=their_dh_pk,
+                bob_spk_pk=their_spk_pk,
+                bob_spk_sig=their_spk_sig,
+                bob_sign_pk=their_sign_pk
+            )
+            logger.info(f"[X3DH] Derived Sender Master Shared Secret with Ephemeral Key EK_A for {contact_id}")
+        elif not is_sender and incoming_header and incoming_header.get("ek"):
+            # Receiver derives shared secret using Alice's Ephemeral Key EK_A passed in initial header
+            alice_ek_pk = nacl.public.PublicKey(b64d(incoming_header["ek"]))
+            my_spk_sk = nacl.public.PrivateKey(b64d(id_data["spk_sk"]))
+            shared_secret = x3dh_receiver_derive(
+                bob_ik_sk=my_dh_sk,
+                bob_spk_sk=my_spk_sk,
+                alice_ik_pk=their_dh_pk,
+                alice_ek_pk=alice_ek_pk
+            )
+            logger.info(f"[X3DH] Derived Receiver Master Shared Secret using received Ephemeral Key EK_A from {contact_id}")
         else:
             # Fallback 1-step DH
             shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
 
         if is_sender:
-            st = init_as_sender(shared_secret, contact["dh_pk"])
+            st = init_as_sender(shared_secret, contact["dh_pk"], ek_a=ek_a)
         else:
             st = init_as_receiver(shared_secret, id_data["dh_sk"])
 
-        # ENCRYPT Shared Secret At-Rest in DB (Resolves Vault Audit Finding)
         enc_shared_secret = vault_encrypt(b64e(shared_secret))
         enc_state = vault_encrypt(st.to_json())
 
@@ -771,7 +771,7 @@ async def api_send_message(req: SendMsgReq):
 
 @app.post("/messages/receive")
 def api_receive_message(req: IncomingMsg):
-    st = get_or_create_ratchet_session(req.sender_id, is_sender=False)
+    st = get_or_create_ratchet_session(req.sender_id, is_sender=False, incoming_header=req.header)
     plaintext = ratchet_decrypt(st, req.header, req.ciphertext)
     save_ratchet_session(req.sender_id, st)
 
@@ -959,10 +959,6 @@ def remove_group_member(group_id: str, user_id: str):
 
 @app.get("/groups/{group_id}/export-key")
 def export_group_key(group_id: str, recipient_id: str):
-    """
-    Encrypts group sender_key via pairwise Double Ratchet E2EE before exporting.
-    Prevents unencrypted GET plaintext key exposure.
-    """
     with get_db(GROUPS_DB) as db:
         g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
         if not g: raise HTTPException(404, "Group not found")
@@ -1004,6 +1000,58 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 
     return {"ok": True, "id": msg_id, "timestamp": now, "ciphertext": b64e(ct)}
 
+class ReceiveGroupMsgReq(BaseModel):
+    group_id: str
+    ciphertext: str
+
+@app.post("/groups/{group_id}/receive")
+def receive_group_message(group_id: str, req: ReceiveGroupMsgReq):
+    """
+    Decrypts group message payload and VERIFIES cryptographic Ed25519 signature of sender.
+    Prevents group impersonation and forgery.
+    """
+    with get_db(GROUPS_DB) as db:
+        g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
+        if not g: raise HTTPException(404, "Group not found")
+        sender_key = b64d(vault_decrypt(g["sender_key"]))
+
+    try:
+        box = nacl.secret.SecretBox(sender_key)
+        raw_payload = box.decrypt(b64d(req.ciphertext)).decode("utf-8")
+        payload_data = json.loads(raw_payload)
+        
+        content = payload_data["content"]
+        signature_b64 = payload_data["signature"]
+        sender_id = payload_data["sender_id"]
+
+        # Cryptographic Signature Verification
+        with get_db(GROUPS_DB) as db:
+            member = db.execute("SELECT sign_pk FROM group_members WHERE group_id=? AND user_id=?", (group_id, sender_id)).fetchone()
+        
+        if not member:
+            raise HTTPException(403, f"Group member {sender_id} not registered in group")
+
+        sender_sign_pk = nacl.signing.VerifyKey(b64d(member["sign_pk"]))
+        sender_sign_pk.verify(content.encode("utf-8"), b64d(signature_b64))
+
+        logger.info(f"[Group] Cryptographic signature verified for message from {sender_id} in group {group_id}")
+
+        msg_id = secrets.token_hex(16)
+        now = int(time.time())
+        enc_content = vault_encrypt(content)
+
+        with get_db(MSGS_DB) as db:
+            db.execute(
+                "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,0,'received')",
+                (msg_id, group_id, sender_id, enc_content, req.ciphertext, "text", now)
+            )
+            db.commit()
+
+        return {"ok": True, "decrypted": content, "sender_id": sender_id, "signature_verified": True}
+    except Exception as e:
+        logger.error(f"[Group] Group message signature verification failed: {e}")
+        raise HTTPException(400, f"Group message signature verification failed: {e}")
+
 # ─── Hardened Backup / Restore (Anti Zip-Slip Path Traversal Protection) ─────
 @app.get("/backup/export")
 def export_backup():
@@ -1023,7 +1071,6 @@ def import_backup(body: dict):
         with zipfile.ZipFile(_io.BytesIO(raw)) as zf:
             for name in zf.namelist():
                 target_path = (base_dir / name).resolve()
-                # Strict Zip-Slip Validation: ensure target_path is inside base_dir
                 if not str(target_path).startswith(str(base_dir)):
                     raise ValueError(f"Zip-Slip path traversal attempt detected in filename: {name}")
                 with zf.open(name) as src, open(str(target_path), "wb") as dst:
