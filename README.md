@@ -17,7 +17,7 @@ Ein hochmoderner, tragbarer **Zero-Server P2P Ende-zu-Ende verschlüsselter Mess
 
 ```bash
 # 1. Repository klonen
-git clone https://github.com/<dein-username>/Privacy-Messenger.git
+git clone https://github.com/labgrownmango/Privacy-Messenger.git
 cd Privacy-Messenger
 
 # 2. Abhängigkeiten installieren
@@ -41,4 +41,8 @@ npm run build
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter der **MIT-Lizenz** — siehe die [LICENSE](LICENSE) Datei für Details.
+Dieses Projekt steht unter einer **Source-Available Non-Redistribution Lizenz**:
+- ✅ **Erlaubt:** Ansehen, Kompilieren und Modifizieren für den persönlichen / privaten Gebrauch.
+- ❌ **Verboten:** Weitergabe, Weitervertrieb, Veröffentlichung oder Verkauf ohne vorherige schriftliche Genehmigung der Urheber.
+
+Siehe die [LICENSE](LICENSE) Datei für Details.
