@@ -4,8 +4,9 @@ End-to-End FastAPI Integration & Security Boundary Test Suite
 Validates:
 1. Real X3DH Protocol with Ephemeral Key (EK_A) & Signed Prekey (SPK_B) signature verification.
 2. Double Ratchet E2EE message roundtrip across FastAPI endpoints (/messages/send, /messages/receive).
-3. Group Chat message Ed25519 signature verification on the FastAPI endpoint (/groups/{id}/receive).
-4. Strict Security Boundary Tests:
+3. Automatic In-Band Delivery Token Rotation over Double Ratchet payloads.
+4. Group Chat message Ed25519 signature verification on the FastAPI endpoint (/groups/{id}/receive).
+5. Strict Security Boundary Tests:
    - Forged SPK Signature Detection (strict nacl.exceptions.BadSignatureError)
    - Header AEAD AAD Tampering Detection (strict nacl.exceptions.CryptoError)
    - Forged Group Message Signature Detection on FastAPI Endpoint Layer (strict HTTP 400 Signature Failure)
@@ -16,6 +17,7 @@ import sys
 import json
 import time
 import base64
+import secrets
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -35,7 +37,8 @@ from ratchet import (
 import server
 from server import (
     app, API_TOKEN, vault_encrypt, get_db,
-    GROUPS_DB, ReceiveGroupMsgReq, receive_group_message
+    GROUPS_DB, CONTACTS_DB, KEYS_DB, ReceiveGroupMsgReq, receive_group_message,
+    IncomingMsg, api_receive_message, api_add_contact, AddContactReq
 )
 
 def test_full_x3dh_and_double_ratchet_roundtrip():
@@ -154,16 +157,84 @@ def test_strict_negative_security_tamper_detection():
     try:
         ratchet_decrypt(bob_state, tampered_header, ciphertext_b64)
         assert False, "Security Violation: Tampered Header AAD was NOT rejected!"
-    except nacl.exceptions.CryptoError: # Strict Exception Type Check
+    except nacl.exceptions.CryptoError:
         print("[OK] Header AAD tampering strictly rejected with PyNaCl CryptoError.")
 
-def test_fastapi_group_endpoint_forged_signature():
-    print("\n=== [TEST 3] FastAPI Group Endpoint Forged Signature & Membership Verification ===")
-    
-    # Set active Vault Master Key for test environment
+def test_in_band_delivery_token_rotation():
+    print("\n=== [TEST 3] Automatic In-Band Delivery Token Rotation ===")
     server.VAULT_MASTER_KEY = nacl.utils.random(32)
 
-    # 2. Create REAL Group entry in GROUPS_DB with vault-encrypted sender key
+    # Initialize local identity in KEYS_DB
+    sign_sk = nacl.signing.SigningKey.generate()
+    dh_sk = nacl.public.PrivateKey.generate()
+    with get_db(KEYS_DB) as db:
+        db.execute(
+            """INSERT OR REPLACE INTO identity (id, user_id, display_name, sign_pk, sign_sk, dh_pk, dh_sk, created_at)
+               VALUES (1,?,?,?,?,?,?,?)""",
+            ("bob_local_user", "Bob Local", b64e(bytes(sign_sk.verify_key)), vault_encrypt(b64e(bytes(sign_sk))),
+             b64e(bytes(dh_sk.public_key)), vault_encrypt(b64e(bytes(dh_sk))), int(time.time()))
+        )
+        db.commit()
+
+    contact_id = "alice_token_rotation_user"
+    initial_token = b64e(secrets.token_bytes(32))
+    new_rotated_token = b64e(secrets.token_bytes(32))
+
+    # Add contact with initial delivery token
+    api_add_contact(AddContactReq(
+        user_id=contact_id,
+        display_name="Alice Token",
+        sign_pk=b64e(bytes(nacl.signing.SigningKey.generate().verify_key)),
+        dh_pk=b64e(bytes(nacl.public.PrivateKey.generate().public_key)),
+        delivery_token=initial_token
+    ))
+
+    # Create inner payload containing rotated delivery token
+    inner_payload = json.dumps({
+        "text": "Nachricht mit In-Band Token-Rotation",
+        "next_delivery_token": new_rotated_token
+    })
+
+    # Prepare ratchet session
+    alice_ik_sk = nacl.public.PrivateKey.generate()
+    shared_sec = bytes(nacl.public.Box(alice_ik_sk, dh_sk.public_key).shared_key())
+    
+    sender_st = init_as_sender(shared_sec, b64e(bytes(dh_sk.public_key)))
+    receiver_st = init_as_receiver(shared_sec, b64e(bytes(dh_sk)))
+
+    # Save receiver state in sessions table
+    with get_db(KEYS_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO sessions (contact_id, shared_key, ratchet_state, ratchet_role, created_at) VALUES (?,?,?,?,?)",
+            (contact_id, vault_encrypt(b64e(shared_sec)), vault_encrypt(receiver_st.to_json()), "receiver", int(time.time()))
+        )
+        db.commit()
+
+    header, ciphertext_b64 = ratchet_encrypt(sender_st, inner_payload)
+
+    # Receive message via API endpoint
+    inc = IncomingMsg(
+        id=secrets.token_hex(16),
+        sender_id=contact_id,
+        header=header,
+        ciphertext=ciphertext_b64,
+        timestamp=int(time.time())
+    )
+    res = api_receive_message(inc)
+    assert res["ok"] == True
+    assert res["decrypted"] == "Nachricht mit In-Band Token-Rotation"
+
+    # Verify that contact's delivery_token in CONTACTS_DB was updated to new_rotated_token!
+    with get_db(CONTACTS_DB) as db:
+        updated_contact = db.execute("SELECT delivery_token FROM contacts WHERE user_id=?", (contact_id,)).fetchone()
+        assert updated_contact["delivery_token"] == new_rotated_token, "delivery_token in CONTACTS_DB MUST be updated to rotated token!"
+    
+    print("[OK] In-Band Delivery Token Rotation successfully verified! Token updated in DB:", new_rotated_token[:12] + "...")
+
+def test_fastapi_group_endpoint_forged_signature():
+    print("\n=== [TEST 4] FastAPI Group Endpoint Forged Signature & Membership Verification ===")
+    server.VAULT_MASTER_KEY = nacl.utils.random(32)
+
     group_id = "real_group_sec_test_100"
     sender_key = nacl.utils.random(32)
     enc_sender_key = vault_encrypt(b64e(sender_key))
@@ -175,7 +246,6 @@ def test_fastapi_group_endpoint_forged_signature():
         )
         db.commit()
 
-    # 3. Register REAL member Alice in group_members
     alice_id = "alice_registered_member"
     alice_sign_sk = nacl.signing.SigningKey.generate()
     alice_sign_pk = alice_sign_sk.verify_key
@@ -188,7 +258,6 @@ def test_fastapi_group_endpoint_forged_signature():
         )
         db.commit()
 
-    # --- TEST 3A: Valid Group Message Transmission & Signature Verification ---
     content_valid = "Kritische Sicherheitsmeldung an alle Gruppenmitglieder"
     sig_valid = alice_sign_sk.sign(content_valid.encode("utf-8")).signature
 
@@ -208,15 +277,14 @@ def test_fastapi_group_endpoint_forged_signature():
     assert res_valid["decrypted"] == content_valid
     print("[OK] Valid Group Message successfully decrypted and Ed25519 signature verified!")
 
-    # --- TEST 3B: Forged Group Message Signature (Attacker Eve pretending to be Alice) ---
     eve_sign_sk = nacl.signing.SigningKey.generate()
     content_forged = "Gefälschte Nachricht von Eve"
-    forged_sig = eve_sign_sk.sign(content_forged.encode("utf-8")).signature # Signed with Eve's key!
+    forged_sig = eve_sign_sk.sign(content_forged.encode("utf-8")).signature
 
     payload_forged = {
         "content": content_forged,
         "signature": b64e(forged_sig),
-        "sender_id": alice_id # Pretending to be Alice!
+        "sender_id": alice_id
     }
 
     ct_forged = box.encrypt(json.dumps(payload_forged).encode("utf-8"))
@@ -226,11 +294,10 @@ def test_fastapi_group_endpoint_forged_signature():
         receive_group_message(group_id=group_id, req=req_forged)
         assert False, "Security Violation: Forged signature for registered member was NOT rejected!"
     except HTTPException as http_ex:
-        assert http_ex.status_code == 400, f"Expected HTTP 400 Signature Failure, got {http_ex.status_code}"
+        assert http_ex.status_code == 400
         assert "signature verification failed" in str(http_ex.detail).lower()
         print(f"[OK] Forged Group Message Signature strictly rejected with HTTP 400: '{http_ex.detail}'")
 
-    # --- TEST 3C: Unregistered Group Member Attempt ---
     payload_unregistered = {
         "content": "Unbefugter Gruppenbeitrag",
         "signature": b64e(forged_sig),
@@ -242,14 +309,15 @@ def test_fastapi_group_endpoint_forged_signature():
 
     try:
         receive_group_message(group_id=group_id, req=req_unregistered)
-        assert False, "Security Violation: Unregistered group member message was NOT rejected!"
+        assert False
     except HTTPException as http_ex:
-        assert http_ex.status_code == 403, f"Expected HTTP 403 Membership Failure, got {http_ex.status_code}"
+        assert http_ex.status_code == 403
         assert "not registered in group" in str(http_ex.detail).lower()
         print(f"[OK] Unregistered Group Member strictly rejected with HTTP 403: '{http_ex.detail}'")
 
 if __name__ == "__main__":
     test_full_x3dh_and_double_ratchet_roundtrip()
     test_strict_negative_security_tamper_detection()
+    test_in_band_delivery_token_rotation()
     test_fastapi_group_endpoint_forged_signature()
     print("\nALL FASTAPI INTEGRATION & RIGOROUS SECURITY BOUNDARY TESTS PASSED 100% SUCCESSFULLY!")

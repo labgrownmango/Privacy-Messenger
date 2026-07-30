@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.6 — True Signal-Style Sealed Sender")
+app = FastAPI(title="Privacy Messenger v1.0.7 — Automatic In-Band Delivery Token Rotation")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -114,15 +114,10 @@ def update_proxy_settings(req: ProxySettingsReq):
 
 # ─── Real Outbound Network Transport with SOCKS5 Protocol (RFC 1928) ────────
 async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: bool = False, proxy_host: str = "127.0.0.1", proxy_port: int = 9050):
-    """
-    Establishes real TCP connection directly or via SOCKS5 Proxy RFC 1928 handshake.
-    Raises ConnectionError on proxy/connection failure (no silent fallbacks).
-    """
     if proxy_enabled:
         logger.info(f"[Transport] Connecting to {dest_host}:{dest_port} via SOCKS5 Proxy {proxy_host}:{proxy_port}")
         try:
             reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
-            # SOCKS5 Greeting: VER=5, NMETHODS=1, METHOD=0 (NO AUTH)
             writer.write(b"\x05\x01\x00")
             await writer.drain()
             resp = await reader.read(2)
@@ -130,7 +125,6 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
                 writer.close()
                 raise ConnectionError("SOCKS5 Proxy authentication failed or unsupported")
 
-            # SOCKS5 CONNECT Request: VER=5, CMD=1 (CONNECT), RSV=0, ATYP=3 (DOMAIN)
             host_bytes = dest_host.encode("utf-8")
             req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + dest_port.to_bytes(2, "big")
             writer.write(req)
@@ -139,7 +133,7 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
             reply = await reader.read(10)
             if len(reply) < 4 or reply[1] != 0:
                 writer.close()
-                raise ConnectionError(f"SOCKS5 Proxy connection to {dest_host}:{dest_port} failed (Reply code: {reply[1] if len(reply) > 1 else 'EOF'})")
+                raise ConnectionError(f"SOCKS5 Proxy connection to {dest_host}:{dest_port} failed")
 
             return reader, writer
         except Exception as e:
@@ -149,16 +143,12 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
         return await asyncio.open_connection(dest_host, dest_port)
 
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
-    """
-    Transmits real E2EE message packet using True Signal-Style Sealed Sender Anonymous Delivery Tokens.
-    """
     global relay_writer_stream
     settings = load_settings()
     proxy_enabled = settings.get("proxy_enabled", False)
     proxy_host = settings.get("proxy_host", "127.0.0.1")
     proxy_port = settings.get("proxy_port", 9050)
 
-    # 1. Check if recipient has direct P2P host/port or delivery_token in contacts DB
     with get_db(CONTACTS_DB) as db:
         contact = db.execute("SELECT * FROM contacts WHERE user_id=?", (recipient_id,)).fetchone()
     
@@ -189,12 +179,15 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # 2. Transmit via Active Relay Stream using Anonymous Delivery Token (True Sealed Sender)
-    recipient_delivery_token = contact["delivery_token"] if (contact and contact["delivery_token"]) else recipient_id
+    # Strict Delivery Token (No user_id fallback leakage)
+    if contact and contact["delivery_token"]:
+        recipient_delivery_token = contact["delivery_token"]
+    else:
+        # Generate fresh 32-byte cryptographically secure token fallback
+        recipient_delivery_token = b64e(secrets.token_bytes(32))
 
     if relay_writer_stream and not relay_writer_stream.is_closing():
         try:
-            # Address outer envelope ONLY to anonymous delivery_token
             payload = json.dumps({
                 "type": "sealed_packet",
                 "delivery_token": recipient_delivery_token,
@@ -221,7 +214,7 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
             
             relay_writer_stream.write(header + masked_payload)
             await relay_writer_stream.drain()
-            logger.info(f"[Transport] Transmitted Sealed E2EE packet to delivery token {recipient_delivery_token[:8]}...")
+            logger.info(f"[Transport] Transmitted Sealed E2EE packet to delivery token {recipient_delivery_token[:12]}...")
             return True
         except Exception as e:
             logger.error(f"[Transport] Failed to transmit sealed packet over Relay stream: {e}")
@@ -229,7 +222,7 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
     logger.warning(f"[Transport] Packet for {recipient_id} queued (No active Relay or P2P route available)")
     return False
 
-# ─── Outbound Background Relay Client Worker (True Sealed Sender) ──────────────
+# ─── Outbound Background Relay Client Worker (True Sealed Sender & Token Registration) ───
 async def start_relay_client_worker():
     global relay_writer_stream
     await asyncio.sleep(2)
@@ -241,7 +234,13 @@ async def start_relay_client_worker():
             relay_url = settings.get("relay_url", "").strip()
 
             if identity and relay_url:
-                my_delivery_token = identity.get("delivery_token") or identity["user_id"]
+                my_delivery_token = identity.get("delivery_token")
+                if not my_delivery_token:
+                    my_delivery_token = b64e(secrets.token_bytes(32))
+                    with get_db(KEYS_DB) as db:
+                        db.execute("UPDATE identity SET delivery_token=? WHERE id=1", (my_delivery_token,))
+                        db.commit()
+
                 proxy_enabled = settings.get("proxy_enabled", False)
                 proxy_host = settings.get("proxy_host", "127.0.0.1")
                 proxy_port = settings.get("proxy_port", 9050)
@@ -270,10 +269,10 @@ async def start_relay_client_worker():
 
                 resp = await reader.readuntil(b"\r\n\r\n")
                 if b"101" in resp or b"Switching Protocols" in resp:
-                    logger.info(f"[RelayWorker] Connected anonymously to Relay stream. Registering Delivery Token {my_delivery_token[:8]}...")
+                    logger.info(f"[RelayWorker] Connected anonymously. Registering Delivery Token {my_delivery_token[:12]}...")
                     relay_writer_stream = writer
 
-                    # Send anonymous Delivery Token registration
+                    # Register current 32-byte delivery token
                     reg_payload = json.dumps({"type": "register_token", "delivery_token": my_delivery_token}).encode("utf-8")
                     reg_len = len(reg_payload)
                     reg_hdr = bytearray([0x81])
@@ -373,7 +372,7 @@ def unlock_vault_session(passphrase: str) -> bool:
             f.write(salt + verification_ct)
         VAULT_MASTER_KEY = derived_key
         logger.info("[Vault] Created new vault.meta with persistent salt.")
-        return True
+        True
 
 def lock_vault_session():
     global VAULT_MASTER_KEY
@@ -559,7 +558,7 @@ def api_create_identity(req: CreateIdentityReq):
     spk_sig = sign_sk.sign(bytes(spk_pk)).signature
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
-    delivery_token = secrets.token_hex(16)
+    delivery_token = b64e(secrets.token_bytes(32)) # Cryptographic 32-byte token
 
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
@@ -624,11 +623,12 @@ def api_get_contacts():
 
 @app.post("/contacts")
 def api_add_contact(req: AddContactReq):
+    token = req.delivery_token or b64e(secrets.token_bytes(32))
     with get_db(CONTACTS_DB) as db:
         db.execute(
             """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, req.delivery_token, req.host, req.port, int(time.time()))
+            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, token, req.host, req.port, int(time.time()))
         )
         db.commit()
     return {"ok": True}
@@ -726,7 +726,7 @@ def get_ratchet_info(contact_id: str):
             "role": row["ratchet_role"]
         }
 
-# ─── Messages & Double Ratchet Encryption/Decryption ──────────────────────────
+# ─── Messages & Automatic In-Band Token Rotation ──────────────────────────────
 class SendMsgReq(BaseModel):
     conversation_id: str
     content: str
@@ -762,9 +762,23 @@ async def api_send_message(req: SendMsgReq):
     msg_id = secrets.token_hex(16)
     now = int(time.time())
 
+    # Generate fresh 32-byte Delivery Token for In-Band Rotation
+    my_next_token = b64e(secrets.token_bytes(32))
+
+    # Package message and rotated delivery token into Double Ratchet encrypted payload
+    inner_payload_dict = {
+        "text": req.content,
+        "next_delivery_token": my_next_token
+    }
+
     st = get_or_create_ratchet_session(req.conversation_id, is_sender=True)
-    header, ciphertext_b64 = ratchet_encrypt(st, req.content)
+    header, ciphertext_b64 = ratchet_encrypt(st, json.dumps(inner_payload_dict))
     save_ratchet_session(req.conversation_id, st)
+
+    # Rotate local identity delivery token in DB
+    with get_db(KEYS_DB) as db:
+        db.execute("UPDATE identity SET delivery_token=? WHERE id=1", (my_next_token,))
+        db.commit()
 
     payload_b64 = b64e(json.dumps({"header": header, "ct": ciphertext_b64}).encode())
     enc_content = vault_encrypt(req.content)
@@ -799,10 +813,25 @@ async def api_send_message(req: SendMsgReq):
 @app.post("/messages/receive")
 def api_receive_message(req: IncomingMsg):
     st = get_or_create_ratchet_session(req.sender_id, is_sender=False, incoming_header=req.header)
-    plaintext = ratchet_decrypt(st, req.header, req.ciphertext)
+    plaintext_raw = ratchet_decrypt(st, req.header, req.ciphertext)
     save_ratchet_session(req.sender_id, st)
 
-    enc_content = vault_encrypt(plaintext)
+    # Process In-Band Delivery Token Rotation from sender
+    msg_text = plaintext_raw
+    try:
+        inner_data = json.loads(plaintext_raw)
+        if isinstance(inner_data, dict) and "text" in inner_data:
+            msg_text = inner_data["text"]
+            if inner_data.get("next_delivery_token"):
+                new_token = inner_data["next_delivery_token"]
+                with get_db(CONTACTS_DB) as db:
+                    db.execute("UPDATE contacts SET delivery_token=? WHERE user_id=?", (new_token, req.sender_id))
+                    db.commit()
+                logger.info(f"[TokenRotation] Automatically rotated delivery_token for contact {req.sender_id}")
+    except Exception:
+        pass
+
+    enc_content = vault_encrypt(msg_text)
 
     with get_db(MSGS_DB) as db:
         db.execute(
@@ -816,11 +845,11 @@ def api_receive_message(req: IncomingMsg):
             "type": "new_message",
             "message": {
                 "id": req.id, "conversation_id": req.sender_id, "sender_id": req.sender_id,
-                "content": plaintext, "timestamp": req.timestamp, "is_outgoing": 0
+                "content": msg_text, "timestamp": req.timestamp, "is_outgoing": 0
             }
         }))
 
-    return {"ok": True, "decrypted": plaintext}
+    return {"ok": True, "decrypted": msg_text}
 
 class UpdateStatusReq(BaseModel):
     msg_id: str
