@@ -41,7 +41,7 @@ npm run build
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter der **PolyForm Noncommercial License 1.0.0 (mit Rechteinhaber-Vorbehalt)**:
+Dieses Projekt steht unter der **Privacy Messenger Custom Non-Commercial License 1.0**:
 - ✅ **Erlaubt:** Ansehen, Kompilieren, Modifizieren und Weitergeben für nicht-kommerzielle Zwecke.
 - ❌ **Verboten für Dritte:** Kommerzielle Nutzung/Monetarisierung und Massen-Weiterverteilung ohne schriftliche Genehmigung.
 - ⚖️ **Rechteinhaber-Vorbehalt:** Offizielle Releases und Monetarisierung durch die Urheber (auf GitHub, Modrinth etc.) sind ausdrücklich gestattet.
