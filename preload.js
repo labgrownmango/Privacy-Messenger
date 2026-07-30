@@ -21,6 +21,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
 })
 
 contextBridge.exposeInMainWorld('messenger', {
+  // Vault Control (At-Rest PBKDF2 Master Key)
+  getVaultStatus: () => apiFetch('/vault/status'),
+  unlockVault:    (passphrase) => apiFetch('/vault/unlock', { method: 'POST', body: JSON.stringify({ passphrase }) }),
+  lockVault:      () => apiFetch('/vault/lock', { method: 'POST' }),
+
   // Identity
   getIdentity:    () => apiFetch('/identity'),
   createIdentity: (display_name) => apiFetch('/identity', { method: 'POST', body: JSON.stringify({ display_name }) }),

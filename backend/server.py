@@ -50,8 +50,9 @@ KEYS_DB     = APP_DATA / "keys.db"
 MSGS_DB     = APP_DATA / "messages.db"
 CONTACTS_DB = APP_DATA / "contacts.db"
 GROUPS_DB   = APP_DATA / "groups.db"
+VAULT_META  = APP_DATA / "vault.meta"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Full Double Ratchet & Hardened E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Hardened Vault & E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -68,37 +69,99 @@ async def enforce_auth_token(request: Request, call_next):
 
 connected_ws: dict[str, WebSocket] = {}
 
-# ─── Storage At-Rest Encryption Vault Primitives (PBKDF2 + AES-256-GCM / SecretBox) ───
+# ─── Functional At-Rest Storage Encryption Vault (PBKDF2 + Persistent Salt + SecretBox) ───
 VAULT_MASTER_KEY: Optional[bytes] = None
 
 def derive_vault_key(passphrase: str, salt: bytes) -> bytes:
     """Derive 32-byte master key using PBKDF2-SHA256 (600,000 iterations)."""
     return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 600000, 32)
 
-def vault_encrypt(plaintext: str, key: Optional[bytes] = None) -> str:
-    """Encrypt sensitive string at rest using ChaCha20-Poly1305 / SecretBox."""
+def unlock_vault_session(passphrase: str) -> bool:
+    global VAULT_MASTER_KEY
+    if not passphrase:
+        return False
+
+    if VAULT_META.exists():
+        try:
+            with open(VAULT_META, "rb") as f:
+                meta = f.read()
+            salt = meta[:16]
+            verification_ct = meta[16:]
+            derived_key = derive_vault_key(passphrase, salt)
+            box = nacl.secret.SecretBox(derived_key)
+            test_plain = box.decrypt(verification_ct)
+            if test_plain == b"PM_VAULT_OK":
+                VAULT_MASTER_KEY = derived_key
+                logger.info("[Vault] Successfully unlocked with master key.")
+                return True
+            else:
+                return False
+        except Exception as e:
+            logger.warning(f"[Vault] Passphrase decryption failed: {e}")
+            return False
+    else:
+        # First-time setup: Generate persistent 16-byte salt and encrypted verification tag
+        salt = nacl.utils.random(16)
+        derived_key = derive_vault_key(passphrase, salt)
+        box = nacl.secret.SecretBox(derived_key)
+        verification_ct = box.encrypt(b"PM_VAULT_OK")
+        with open(VAULT_META, "wb") as f:
+            f.write(salt + verification_ct)
+        VAULT_MASTER_KEY = derived_key
+        logger.info("[Vault] Created new vault.meta with persistent salt.")
+        return True
+
+def lock_vault_session():
+    global VAULT_MASTER_KEY
+    VAULT_MASTER_KEY = None
+    logger.info("[Vault] Locked vault session.")
+
+def vault_encrypt(plaintext: str) -> str:
+    """Encrypt sensitive string at rest using ChaCha20-Poly1305 SecretBox with VAULT_MASTER_KEY."""
     if not plaintext: return ""
-    use_key = key or VAULT_MASTER_KEY
-    if not use_key:
-        return plaintext   # Fallback if vault unlocked without master key
-    box = nacl.secret.SecretBox(use_key)
+    if not VAULT_MASTER_KEY:
+        # Fallback to unencrypted if vault not configured yet
+        return plaintext
+    box = nacl.secret.SecretBox(VAULT_MASTER_KEY)
     ct = box.encrypt(plaintext.encode("utf-8"))
     return "ENC:" + b64e(ct)
 
-def vault_decrypt(ciphertext_str: str, key: Optional[bytes] = None) -> str:
+def vault_decrypt(ciphertext_str: str) -> str:
     """Decrypt sensitive string at rest."""
     if not ciphertext_str: return ""
     if not ciphertext_str.startswith("ENC:"):
         return ciphertext_str   # Legacy unencrypted data
-    use_key = key or VAULT_MASTER_KEY
-    if not use_key:
-        return "[LOCKED]"   # Vault locked
+    if not VAULT_MASTER_KEY:
+        return "[VAULT_LOCKED]"
     try:
         raw_ct = b64d(ciphertext_str[4:])
-        box = nacl.secret.SecretBox(use_key)
+        box = nacl.secret.SecretBox(VAULT_MASTER_KEY)
         return box.decrypt(raw_ct).decode("utf-8")
     except Exception:
         return "[DECRYPTION_FAILED]"
+
+# ─── Vault Control API Endpoints ──────────────────────────────────────────────
+class VaultUnlockReq(BaseModel):
+    passphrase: str
+
+@app.get("/vault/status")
+def vault_status():
+    return {
+        "unlocked": VAULT_MASTER_KEY is not None,
+        "has_vault": VAULT_META.exists()
+    }
+
+@app.post("/vault/unlock")
+def vault_unlock(req: VaultUnlockReq):
+    success = unlock_vault_session(req.passphrase)
+    if not success:
+        raise HTTPException(401, "Invalid Master Passphrase / PIN")
+    return {"ok": True, "unlocked": True}
+
+@app.post("/vault/lock")
+def vault_lock():
+    lock_vault_session()
+    return {"ok": True, "unlocked": False}
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def get_db(path: Path):
@@ -165,7 +228,6 @@ def get_identity() -> Optional[dict]:
         row = db.execute("SELECT * FROM identity WHERE id=1").fetchone()
         if not row: return None
         d = dict(row)
-        # Decrypt private keys if encrypted at rest
         d["sign_sk"] = vault_decrypt(d["sign_sk"])
         d["dh_sk"]   = vault_decrypt(d["dh_sk"])
         return d
@@ -202,7 +264,6 @@ def api_create_identity(req: CreateIdentityReq):
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
 
-    # Encrypt private keys at rest
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
 
@@ -606,7 +667,7 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 def export_backup():
     buf = _io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in [KEYS_DB, MSGS_DB, CONTACTS_DB, GROUPS_DB]:
+        for p in [KEYS_DB, MSGS_DB, CONTACTS_DB, GROUPS_DB, VAULT_META]:
             if p.exists():
                 zf.write(str(p), p.name)
     b64 = base64.b64encode(buf.getvalue()).decode()
