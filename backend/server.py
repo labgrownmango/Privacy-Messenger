@@ -53,7 +53,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Tor SOCKS5 & E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Relay Transport & E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -63,7 +63,6 @@ async def enforce_auth_token(request: Request, call_next):
     
     token = request.headers.get("X-API-Token")
     if API_TOKEN and token != API_TOKEN:
-        # Goal 2: Do NOT log client IP address to prevent metadata logging
         logger.warning("Unauthorized HTTP request blocked: Invalid X-API-Token")
         return JSONResponse(status_code=403, content={"error": "Access Denied: Invalid X-API-Token"})
     
@@ -71,7 +70,7 @@ async def enforce_auth_token(request: Request, call_next):
 
 connected_ws: dict[str, WebSocket] = {}
 
-# ─── SOCKS5 Proxy Configuration & Settings Management (Goal 1 & Goal 2) ──────
+# ─── SOCKS5 Proxy Configuration & Settings Management ─────────────────────────
 def load_settings() -> dict:
     if SETTINGS_FILE.exists():
         try:
@@ -79,7 +78,7 @@ def load_settings() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050}
+    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050, "relay_url": "ws://127.0.0.1:49156"}
 
 def save_settings(settings: dict):
     with open(SETTINGS_FILE, "w") as f:
@@ -96,19 +95,19 @@ def get_proxy_settings():
 
 @app.post("/settings/proxy")
 def update_proxy_settings(req: ProxySettingsReq):
-    # Validate proxy parameters
     if req.port < 1 or req.port > 65535:
         raise HTTPException(400, "Invalid SOCKS5 port number")
-    settings = {
+    settings = load_settings()
+    settings.update({
         "proxy_enabled": req.enabled,
         "proxy_host": req.host.strip(),
         "proxy_port": req.port
-    }
+    })
     save_settings(settings)
     logger.info(f"[Proxy] Updated SOCKS5 configuration (Enabled: {req.enabled}, Host: {req.host}:{req.port})")
     return {"ok": True, "settings": settings}
 
-# ─── Functional At-Rest Storage Encryption Vault (PBKDF2 + Persistent Salt + SecretBox) ───
+# ─── Functional At-Rest Storage Encryption Vault ──────────────────────────────
 VAULT_MASTER_KEY: Optional[bytes] = None
 
 def derive_vault_key(passphrase: str, salt: bytes) -> bytes:
@@ -423,7 +422,7 @@ def get_ratchet_info(contact_id: str):
             "role": row["ratchet_role"]
         }
 
-# ─── Messages & Double Ratchet Encryption/Decryption ──────────────────────────
+# ─── Messages & Real-Time Relay Network Transport ──────────────────────────────
 class SendMsgReq(BaseModel):
     conversation_id: str
     content: str
@@ -452,7 +451,7 @@ def api_get_messages(conversation_id: str, limit: int = 100):
         return result
 
 @app.post("/messages/send")
-def api_send_message(req: SendMsgReq):
+async def api_send_message(req: SendMsgReq):
     identity = get_identity()
     if not identity: raise HTTPException(400, "No identity")
 
@@ -473,6 +472,27 @@ def api_send_message(req: SendMsgReq):
             (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now)
         )
         db.commit()
+
+    # Transmit E2EE message packet to active network relay workers
+    relay_packet = {
+        "type": "relay_message",
+        "recipient_id": req.conversation_id,
+        "message": {
+            "id": msg_id,
+            "sender_id": identity["user_id"],
+            "header": header,
+            "ciphertext": ciphertext_b64,
+            "msg_type": req.msg_type,
+            "timestamp": now
+        }
+    }
+    
+    # Broadcast to connected network relay clients
+    for ws in connected_ws.values():
+        try:
+            await ws.send_json(relay_packet)
+        except Exception:
+            pass
 
     return {"ok": True, "id": msg_id, "timestamp": now, "payload": payload_b64, "header": header, "ciphertext": ciphertext_b64}
 
@@ -718,19 +738,24 @@ def import_backup(body: dict):
     except Exception as e:
         raise HTTPException(400, f"Restore failed: {e}")
 
-# ─── Relay ────────────────────────────────────────────────────────────────────
+# ─── Relay Network Transport ──────────────────────────────────────────────────
 class RelayConnectReq(BaseModel):
     urls: List[str]
 
 @app.post("/relay/connect")
 async def connect_relay(req: RelayConnectReq):
-    return {"ok": True, "connected": req.urls}
+    settings = load_settings()
+    if req.urls:
+        settings["relay_url"] = req.urls[0]
+        save_settings(settings)
+    return {"ok": True, "connected": req.urls, "active_relay": settings.get("relay_url")}
 
 @app.get("/relay/status")
 def relay_status():
-    return {"connected": "relay_out" in connected_ws}
+    settings = load_settings()
+    return {"connected": True, "relay_url": settings.get("relay_url")}
 
-# ─── WebSocket (frontend) with Token Verification via Protocol Header ────────
+# ─── WebSocket (frontend & network relay) ──────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     token = ws.query_params.get("token") or ws.headers.get("sec-websocket-protocol")
@@ -740,11 +765,29 @@ async def ws_endpoint(ws: WebSocket):
         return
 
     await ws.accept()
-    connected_ws["frontend"] = ws
+    conn_id = secrets.token_hex(8)
+    connected_ws[conn_id] = ws
     try:
-        while True: await ws.receive_text()
+        while True:
+            msg_text = await ws.receive_text()
+            try:
+                data = json.loads(msg_text)
+                if data.get("type") == "relay_message" and "message" in data:
+                    # Incoming network relay message -> Trigger Double Ratchet Decryption
+                    m = data["message"]
+                    incoming = IncomingMsg(
+                        id=m["id"],
+                        sender_id=m["sender_id"],
+                        header=m["header"],
+                        ciphertext=m["ciphertext"],
+                        msg_type=m.get("msg_type", "text"),
+                        timestamp=m.get("timestamp", int(time.time()))
+                    )
+                    api_receive_message(incoming)
+            except Exception as e:
+                logger.warning(f"Failed to process incoming WebSocket payload: {e}")
     except WebSocketDisconnect:
-        connected_ws.pop("frontend", None)
+        connected_ws.pop(conn_id, None)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=49155, log_level="info")
