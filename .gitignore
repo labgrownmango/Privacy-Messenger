@@ -1,9 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
 node_modules/
 dist/
 build/
-backend-dist/
 *.db
-*.log
-*.tmp
-.DS_Store
-Thumbs.db
+vault.meta
+settings.json
