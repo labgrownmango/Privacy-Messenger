@@ -1,11 +1,14 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
+const API_TOKEN = process.env.PM_API_TOKEN || ''
 const API = 'http://127.0.0.1:49155'
-const apiFetch = (path, opts = {}) =>
-  fetch(`${API}${path}`, { headers: { 'Content-Type': 'application/json' }, ...opts })
-    .then(r => r.json())
 
-// QR code generation (pure Node.js, no canvas needed)
+const apiFetch = (path, opts = {}) => {
+  const headers = { 'Content-Type': 'application/json', 'X-API-Token': API_TOKEN, ...(opts.headers || {}) }
+  return fetch(`${API}${path}`, { ...opts, headers }).then(r => r.json())
+}
+
+// QR code generation (pure Node.js)
 let _qr = null
 try { _qr = require('qrcode') } catch (e) { console.warn('qrcode module not found:', e.message) }
 
@@ -65,22 +68,22 @@ contextBridge.exposeInMainWorld('messenger', {
   exportBackup: () => apiFetch('/backup/export'),
   importBackup: (data_b64) => apiFetch('/backup/import', { method: 'POST', body: JSON.stringify({ data: data_b64 }) }),
 
-  // WebSocket
+  // WebSocket with API Token Query Param
   connectWS: (onMessage) => {
-    const ws = new WebSocket('ws://127.0.0.1:49155/ws')
+    const ws = new WebSocket(`ws://127.0.0.1:49155/ws?token=${API_TOKEN}`)
     ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)) } catch {} }
     ws.onclose = () => setTimeout(() => window.messenger.connectWS(onMessage), 2000)
     return ws
   },
 
-  // QR Code — tries native module, falls back to null (HTML will use canvas fallback)
+  // QR Code
   generateQR: async (text) => {
     if (_qr) {
       try {
         return await _qr.toDataURL(text, { width: 256, margin: 2, color: { dark: '#5865f0', light: '#12151f' } })
       } catch (e) { console.warn('QR gen failed:', e) }
     }
-    return null   // caller handles null gracefully
+    return null
   },
 
   // File helpers
@@ -91,31 +94,21 @@ contextBridge.exposeInMainWorld('messenger', {
     reader.readAsDataURL(file)
   }),
 
-  // Image compression via canvas
   compressImage: (file, maxWidth = 1280, quality = 0.82) => new Promise((resolve) => {
     const reader = new FileReader()
     reader.onload = (e) => {
       const img = new Image()
       img.onload = () => {
         const canvas = document.createElement('canvas')
-        let { width, height } = img
-        if (width > maxWidth) { height = Math.round((height * maxWidth) / width); width = maxWidth }
-        canvas.width = width; canvas.height = height
-        canvas.getContext('2d').drawImage(img, 0, 0, width, height)
+        let w = img.width, h = img.height
+        if (w > maxWidth) { h = Math.round((h * maxWidth) / w); w = maxWidth }
+        canvas.width = w; canvas.height = h
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(img, 0, 0, w, h)
         resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1])
       }
       img.src = e.target.result
     }
     reader.readAsDataURL(file)
-  }),
-
-  // Save file
-  saveFile: (filename, b64) => {
-    const a = document.createElement('a')
-    a.href = `data:application/octet-stream;base64,${b64}`
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-  }
+  })
 })

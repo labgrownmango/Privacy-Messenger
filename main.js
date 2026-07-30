@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, shell, Tray, Menu, Notification, nativeImag
 const path = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
+const crypto = require('crypto')
 
 let mainWindow
 let tray
@@ -10,9 +11,9 @@ let isQuitting = false
 
 const BACKEND_PORT = 49155
 
-// ─── Screen Security ─────────────────────────────────────────────────────────
-// setContentProtection is macOS-only; on Windows we use a workaround via BrowserWindow options
-const IS_WIN = process.platform === 'win32'
+// Generate secure random API Secret Token for Localhost API protection
+const API_TOKEN = process.env.PM_API_TOKEN || crypto.randomBytes(32).toString('hex')
+process.env.PM_API_TOKEN = API_TOKEN
 
 // ─── Backend ─────────────────────────────────────────────────────────────────
 function startBackend() {
@@ -22,17 +23,17 @@ function startBackend() {
 
   let usePython = true
   let cmd = 'python'
-  let args = [pyScript]
-  let opts = { stdio: ['ignore', 'pipe', 'pipe'] }
+  let args = [pyScript, `--api-token=${API_TOKEN}`]
+  let opts = { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PM_API_TOKEN: API_TOKEN } }
 
   if (require('fs').existsSync(bundledExe)) {
     cmd = bundledExe
-    args = []
+    args = [`--api-token=${API_TOKEN}`]
     usePython = false
     console.log('[Backend] Attempting bundled exe:', bundledExe)
   } else if (require('fs').existsSync(devExe)) {
     cmd = devExe
-    args = []
+    args = [`--api-token=${API_TOKEN}`]
     usePython = false
     console.log('[Backend] Attempting dev exe:', devExe)
   } else {
@@ -48,7 +49,7 @@ function startBackend() {
       if (!usePython) {
         console.log('[Backend] EXE execution blocked/failed. Falling back to system python...')
         usePython = true
-        run('python', [pyScript])
+        run('python', [pyScript, `--api-token=${API_TOKEN}`])
       }
     })
 
@@ -60,7 +61,7 @@ function startBackend() {
       if (code !== 0 && code !== null && !usePython) {
         console.log('[Backend] EXE exited unexpectedly. Falling back to system python...')
         usePython = true
-        run('python', [pyScript])
+        run('python', [pyScript, `--api-token=${API_TOKEN}`])
       }
     })
   }
@@ -68,11 +69,16 @@ function startBackend() {
   run(cmd, args)
 }
 
-
 function waitForBackend(retries = 30) {
   return new Promise((resolve, reject) => {
     const check = (n) => {
-      http.get(`http://127.0.0.1:${BACKEND_PORT}/identity`, () => resolve())
+      const reqOpts = {
+        hostname: '127.0.0.1',
+        port: BACKEND_PORT,
+        path: '/identity',
+        headers: { 'X-API-Token': API_TOKEN }
+      }
+      http.get(reqOpts, () => resolve())
         .on('error', () => {
           if (n <= 0) return reject(new Error('Backend did not start'))
           setTimeout(() => check(n - 1), 500)
@@ -90,20 +96,19 @@ function createTray() {
     if (require('fs').existsSync(iconPath)) {
       icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 })
     } else {
-      // Fallback: Valid 16x16 PNG base64 (a simple gray square icon)
       const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAMklEQVR42mNgGAWjYBSMglEwCkbBSAcMYGJiYPn/n4GBAc6HieECmJiQxDFlgGgAAAr4CD4qv17lAAAAAElFTkSuQmCC'
       icon = nativeImage.createFromBuffer(Buffer.from(pngBase64, 'base64'))
     }
     
     tray = new Tray(icon)
-    tray.setToolTip('Privacy Messenger 🔐')
+    tray.setToolTip('Privacy Messenger')
 
     const menu = Menu.buildFromTemplate([
       { label: 'Privacy Messenger', enabled: false },
       { type: 'separator' },
-      { label: '🔓 Öffnen', click: () => { mainWindow.show(); mainWindow.focus() } },
+      { label: 'Öffnen', click: () => { mainWindow.show(); mainWindow.focus() } },
       { type: 'separator' },
-      { label: '🚪 Beenden', click: () => { isQuitting = true; app.quit() } }
+      { label: 'Beenden', click: () => { isQuitting = true; app.quit() } }
     ])
     tray.setContextMenu(menu)
 
@@ -113,7 +118,7 @@ function createTray() {
     })
   } catch (err) {
     console.error('Failed to create tray icon:', err)
-    tray = null // Ensure it is null so window close falls back to normal exit
+    tray = null
   }
 }
 
@@ -146,23 +151,18 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false
     },
-    show: false   // show after ready-to-show
+    show: false
   })
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
   mainWindow.loadFile('index.html')
 
-  // Minimize to tray instead of closing
   mainWindow.on('close', (e) => {
     if (!isQuitting && tray) {
       e.preventDefault()
       mainWindow.hide()
-      tray.displayBalloon?.({
-        title: 'Privacy Messenger läuft',
-        content: 'App minimiert ins System-Tray. Doppelklick zum Öffnen.'
-      })
     } else {
-      isQuitting = true
+      isQuitting = true;
       if (backendProcess) backendProcess.kill()
       app.quit()
     }
@@ -179,7 +179,6 @@ async function createWindow() {
 app.whenReady().then(createWindow)
 
 app.on('window-all-closed', () => {
-  // Don't quit on macOS, and keep alive in tray on Windows
   if (process.platform !== 'darwin' && isQuitting) {
     if (backendProcess) backendProcess.kill()
     app.quit()
@@ -197,9 +196,6 @@ app.on('activate', () => {
 
 // ─── IPC ─────────────────────────────────────────────────────────────────────
 ipcMain.on('window-minimize', () => mainWindow.minimize())
-ipcMain.on('window-maximize', () => mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize())
-ipcMain.on('window-close',    () => { mainWindow.hide() })   // hide to tray
+ipcMain.on('window-close',    () => { mainWindow.hide() })
 ipcMain.on('window-quit',     () => { isQuitting = true; app.quit() })
-
-// Push notification from renderer
 ipcMain.on('show-notification', (_, { title, body }) => showNotification(title, body))
