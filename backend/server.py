@@ -32,7 +32,7 @@ from ratchet import (
     ratchet_encrypt, ratchet_decrypt, b64e, b64d
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:00:00")
 logger = logging.getLogger(__name__)
 
 # ─── Command Line Argument Parsing (API Auth Token) ───────────────────────────
@@ -45,14 +45,15 @@ API_TOKEN = args_parsed.api_token or os.environ.get("PM_API_TOKEN", "")
 # ─── Paths ───────────────────────────────────────────────────────────────────
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "PrivacyMessenger"
 APP_DATA.mkdir(parents=True, exist_ok=True)
-FILES_DIR   = APP_DATA / "files"; FILES_DIR.mkdir(exist_ok=True)
-KEYS_DB     = APP_DATA / "keys.db"
-MSGS_DB     = APP_DATA / "messages.db"
-CONTACTS_DB = APP_DATA / "contacts.db"
-GROUPS_DB   = APP_DATA / "groups.db"
-VAULT_META  = APP_DATA / "vault.meta"
+FILES_DIR    = APP_DATA / "files"; FILES_DIR.mkdir(exist_ok=True)
+KEYS_DB      = APP_DATA / "keys.db"
+MSGS_DB      = APP_DATA / "messages.db"
+CONTACTS_DB  = APP_DATA / "contacts.db"
+GROUPS_DB    = APP_DATA / "groups.db"
+VAULT_META   = APP_DATA / "vault.meta"
+SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Hardened Vault & E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Tor SOCKS5 & E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -62,18 +63,55 @@ async def enforce_auth_token(request: Request, call_next):
     
     token = request.headers.get("X-API-Token")
     if API_TOKEN and token != API_TOKEN:
-        logger.warning(f"Unauthorized HTTP request blocked from {request.client.host}")
+        # Goal 2: Do NOT log client IP address to prevent metadata logging
+        logger.warning("Unauthorized HTTP request blocked: Invalid X-API-Token")
         return JSONResponse(status_code=403, content={"error": "Access Denied: Invalid X-API-Token"})
     
     return await call_next(request)
 
 connected_ws: dict[str, WebSocket] = {}
 
+# ─── SOCKS5 Proxy Configuration & Settings Management (Goal 1 & Goal 2) ──────
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050}
+
+def save_settings(settings: dict):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+class ProxySettingsReq(BaseModel):
+    enabled: bool
+    host: str = "127.0.0.1"
+    port: int = 9050
+
+@app.get("/settings/proxy")
+def get_proxy_settings():
+    return load_settings()
+
+@app.post("/settings/proxy")
+def update_proxy_settings(req: ProxySettingsReq):
+    # Validate proxy parameters
+    if req.port < 1 or req.port > 65535:
+        raise HTTPException(400, "Invalid SOCKS5 port number")
+    settings = {
+        "proxy_enabled": req.enabled,
+        "proxy_host": req.host.strip(),
+        "proxy_port": req.port
+    }
+    save_settings(settings)
+    logger.info(f"[Proxy] Updated SOCKS5 configuration (Enabled: {req.enabled}, Host: {req.host}:{req.port})")
+    return {"ok": True, "settings": settings}
+
 # ─── Functional At-Rest Storage Encryption Vault (PBKDF2 + Persistent Salt + SecretBox) ───
 VAULT_MASTER_KEY: Optional[bytes] = None
 
 def derive_vault_key(passphrase: str, salt: bytes) -> bytes:
-    """Derive 32-byte master key using PBKDF2-SHA256 (600,000 iterations)."""
     return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 600000, 32)
 
 def unlock_vault_session(passphrase: str) -> bool:
@@ -100,7 +138,6 @@ def unlock_vault_session(passphrase: str) -> bool:
             logger.warning(f"[Vault] Passphrase decryption failed: {e}")
             return False
     else:
-        # First-time setup: Generate persistent 16-byte salt and encrypted verification tag
         salt = nacl.utils.random(16)
         derived_key = derive_vault_key(passphrase, salt)
         box = nacl.secret.SecretBox(derived_key)
@@ -117,7 +154,6 @@ def lock_vault_session():
     logger.info("[Vault] Locked vault session.")
 
 def vault_encrypt(plaintext: str) -> str:
-    """Encrypt sensitive string at rest. Strictly throws HTTP 423 if vault is locked (no unencrypted fallbacks)."""
     if not plaintext: return ""
     if not VAULT_MASTER_KEY:
         raise HTTPException(status_code=423, detail="Vault is locked. Master passphrase unlock required.")
@@ -126,10 +162,9 @@ def vault_encrypt(plaintext: str) -> str:
     return "ENC:" + b64e(ct)
 
 def vault_decrypt(ciphertext_str: str) -> str:
-    """Decrypt sensitive string at rest."""
     if not ciphertext_str: return ""
     if not ciphertext_str.startswith("ENC:"):
-        return ciphertext_str   # Legacy unencrypted data
+        return ciphertext_str
     if not VAULT_MASTER_KEY:
         return "[VAULT_LOCKED]"
     try:
@@ -348,7 +383,6 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetSt
             dec_state_json = vault_decrypt(row["ratchet_state"])
             return RatchetState.from_json(dec_state_json)
 
-        # Perform X3DH to derive initial shared secret
         my_dh_sk = nacl.public.PrivateKey(b64d(id_data["dh_sk"]))
         their_dh_pk = nacl.public.PublicKey(b64d(contact["dh_pk"]))
         shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
@@ -666,7 +700,7 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 def export_backup():
     buf = _io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in [KEYS_DB, MSGS_DB, CONTACTS_DB, GROUPS_DB, VAULT_META]:
+        for p in [KEYS_DB, MSGS_DB, CONTACTS_DB, GROUPS_DB, VAULT_META, SETTINGS_FILE]:
             if p.exists():
                 zf.write(str(p), p.name)
     b64 = base64.b64encode(buf.getvalue()).decode()
@@ -699,10 +733,9 @@ def relay_status():
 # ─── WebSocket (frontend) with Token Verification via Protocol Header ────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    # Check Sec-WebSocket-Protocol or query parameter for token
     token = ws.query_params.get("token") or ws.headers.get("sec-websocket-protocol")
     if API_TOKEN and token != API_TOKEN:
-        logger.warning(f"WebSocket connection rejected: invalid API token")
+        logger.warning("WebSocket connection rejected: invalid API token")
         await ws.close(code=4003)
         return
 

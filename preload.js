@@ -26,6 +26,10 @@ contextBridge.exposeInMainWorld('messenger', {
   unlockVault:    (passphrase) => apiFetch('/vault/unlock', { method: 'POST', body: JSON.stringify({ passphrase }) }),
   lockVault:      () => apiFetch('/vault/lock', { method: 'POST' }),
 
+  // SOCKS5 Proxy / Tor Configuration (Goal 1 & Goal 2)
+  getProxySettings: () => apiFetch('/settings/proxy'),
+  setProxySettings: (data) => apiFetch('/settings/proxy', { method: 'POST', body: JSON.stringify(data) }),
+
   // Identity
   getIdentity:    () => apiFetch('/identity'),
   createIdentity: (display_name) => apiFetch('/identity', { method: 'POST', body: JSON.stringify({ display_name }) }),
@@ -73,7 +77,7 @@ contextBridge.exposeInMainWorld('messenger', {
   exportBackup: () => apiFetch('/backup/export'),
   importBackup: (data_b64) => apiFetch('/backup/import', { method: 'POST', body: JSON.stringify({ data: data_b64 }) }),
 
-  // WebSocket with Sec-WebSocket-Protocol Header Auth (removes Token from URL)
+  // WebSocket with Sec-WebSocket-Protocol Header Auth
   connectWS: (onMessage) => {
     const ws = API_TOKEN ? new WebSocket('ws://127.0.0.1:49155/ws', [API_TOKEN]) : new WebSocket('ws://127.0.0.1:49155/ws')
     ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)) } catch {} }

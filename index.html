@@ -72,7 +72,7 @@ body { background: var(--bg-dark); color: var(--text-main); height: 100vh; displ
 
 /* Overlays / Modals */
 .modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(20px); display: flex; justify-content: center; align-items: center; z-index: 100; opacity: 1; transition: opacity 0.3s; }
-.modal-box { background: #161b26; border: 1px solid var(--border-glass); border-radius: 20px; padding: 28px; width: 420px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+.modal-box { background: #161b26; border: 1px solid var(--border-glass); border-radius: 20px; padding: 28px; width: 440px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
 .modal-title { font-size: 18px; font-weight: 700; text-align: center; }
 .input-field { background: rgba(0, 0, 0, 0.4); border: 1px solid var(--border-glass); border-radius: 10px; padding: 12px; color: var(--text-main); outline: none; font-size: 14px; width: 100%; }
 .btn-primary { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; border: none; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; width: 100%; }
@@ -93,7 +93,6 @@ body { background: var(--bg-dark); color: var(--text-main); height: 100vh; displ
 </div>
 
 <div class="app-container" id="main">
-  <!-- Dropzone for Drag-and-Drop file encryption -->
   <div class="drop-overlay" id="drop-zone">📂 Datei für E2EE Verschlüsselung ablegen</div>
 
   <!-- Sidebar -->
@@ -168,12 +167,28 @@ body { background: var(--bg-dark); color: var(--text-main); height: 100vh; displ
   </div>
 </div>
 
-<!-- Profile Modal -->
+<!-- Profile & SOCKS5 Proxy Modal -->
 <div class="modal-overlay" id="profile-modal" style="display:none;">
   <div class="modal-box">
-    <div class="modal-title">Dein E2EE Profil</div>
+    <div class="modal-title">Dein E2EE Profil & Netzwerkeinstellungen</div>
     <div style="font-size:12px; color:var(--accent-cyan); word-break:break-all;" id="profile-user-id">User ID: ...</div>
     <div style="font-size:12px; color:var(--text-muted); word-break:break-all;" id="profile-fingerprint">Fingerprint: ...</div>
+    
+    <hr style="border:none; border-top:1px solid var(--border-glass); margin:4px 0;"/>
+
+    <!-- SOCKS5 / Tor Settings Section (Goal 1) -->
+    <div style="font-size:13px; font-weight:700; color:var(--accent-blue);">🧅 SOCKS5 / Tor Proxy Routing</div>
+    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+      <input type="checkbox" id="proxy-enabled-toggle" onchange="toggleProxyUI()"/>
+      <span>Über SOCKS5 Proxy / Tor routen</span>
+    </label>
+    
+    <div id="proxy-fields" style="display:none; flex-direction:column; gap:8px;">
+      <input type="text" id="proxy-host-input" class="input-field" placeholder="Proxy Host (z.B. 127.0.0.1)" value="127.0.0.1"/>
+      <input type="number" id="proxy-port-input" class="input-field" placeholder="Proxy Port (z.B. 9050 für Tor)" value="9050"/>
+      <button class="btn-primary" style="background:linear-gradient(135deg, #00c6ff, #0072ff);" onclick="saveProxySettings()">Proxy Einstellungen Speichern</button>
+    </div>
+
     <button class="btn-primary" onclick="closeProfileModal()">Schließen</button>
   </div>
 </div>
@@ -216,7 +231,6 @@ async function handleUnlockVault() {
 }
 
 async function loadAppContent() {
-  // Load or Create Identity
   let idRes = await window.messenger.getIdentity();
   if (!idRes.exists) {
     idRes = await window.messenger.createIdentity("User-" + Math.floor(Math.random()*1000));
@@ -231,6 +245,9 @@ async function loadAppContent() {
     document.getElementById('profile-fingerprint').innerText = "Fingerprint: SHA-256:" + fp.fingerprint.substring(0, 16).toUpperCase();
   }
 
+  // Load Proxy Settings
+  await loadProxySettings();
+
   await loadContacts();
 
   // Listen to incoming messages via WebSocket
@@ -241,6 +258,37 @@ async function loadAppContent() {
       }
     }
   });
+}
+
+// Proxy / Tor Settings Functions
+async function loadProxySettings() {
+  try {
+    const s = await window.messenger.getProxySettings();
+    document.getElementById('proxy-enabled-toggle').checked = s.proxy_enabled || false;
+    document.getElementById('proxy-host-input').value = s.proxy_host || '127.0.0.1';
+    document.getElementById('proxy-port-input').value = s.proxy_port || 9050;
+    toggleProxyUI();
+  } catch (err) {
+    console.warn('Failed to load proxy settings:', err);
+  }
+}
+
+function toggleProxyUI() {
+  const enabled = document.getElementById('proxy-enabled-toggle').checked;
+  document.getElementById('proxy-fields').style.display = enabled ? 'flex' : 'none';
+}
+
+async function saveProxySettings() {
+  const enabled = document.getElementById('proxy-enabled-toggle').checked;
+  const host = document.getElementById('proxy-host-input').value.trim();
+  const port = parseInt(document.getElementById('proxy-port-input').value, 10);
+
+  const res = await window.messenger.setProxySettings({ enabled, host, port });
+  if (res && res.ok) {
+    alert("SOCKS5 Proxy-Einstellungen erfolgreich gespeichert!");
+  } else {
+    alert("Fehler beim Speichern der SOCKS5 Einstellungen!");
+  }
 }
 
 async function loadContacts() {
@@ -272,7 +320,6 @@ async function selectContact(contact) {
   await loadContacts();
   await loadMessages(contact.user_id);
 
-  // Check Double Ratchet status
   const rInfo = await window.messenger.getRatchetInfo(contact.user_id);
   if (rInfo.active) {
     document.getElementById('chat-ratchet-status').innerText = `Double Ratchet Aktiv (Sent: ${rInfo.ns}, Recv: ${rInfo.nr})`;
@@ -305,7 +352,6 @@ async function sendChatMessage() {
   const text = input.value.trim();
   if (!text || !currentActiveContactId) return;
 
-  // Real Backend E2EE Send Call
   await window.messenger.sendMessage({ conversation_id: currentActiveContactId, content: text });
   appendMessageUI(text, true);
   input.value = '';
