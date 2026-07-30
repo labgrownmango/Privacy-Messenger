@@ -1,406 +1,325 @@
 <!DOCTYPE html>
-<!-- Privacy Messenger v1.0.2 — Balanced Professional Enterprise Edition -->
 <html lang="de">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src http://127.0.0.1:49155 ws://127.0.0.1:49155; font-src data:;"/>
-<title>Privacy Messenger 1.0.2</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Privacy Messenger 🔐 — Double Ratchet & Enterprise E2EE</title>
 <style>
 :root {
-  --bg-primary: #090b10;
-  --bg-glass: rgba(18, 22, 34, 0.75);
-  --bg-glass-card: rgba(26, 32, 50, 0.65);
-  --bg-panel: rgba(14, 18, 28, 0.85);
+  --bg-dark: #0c0e14;
+  --bg-panel: rgba(22, 27, 38, 0.75);
+  --bg-card: rgba(30, 37, 52, 0.6);
+  --accent-cyan: #00f2fe;
+  --accent-blue: #4facfe;
+  --text-main: #e2e8f0;
+  --text-muted: #94a3b8;
   --border-glass: rgba(255, 255, 255, 0.08);
-  --border-glow: rgba(0, 255, 136, 0.3);
-
-  --accent-emerald: #00ff88;
-  --accent-cyan: #00e5ff;
-  --accent-purple: #9d4edd;
-  --accent-pink: #f72585;
-
-  --text-main: #f0f3fe;
-  --text-muted: #8892b0;
-  --text-dim: #565f80;
-
-  --msg-out: linear-gradient(135deg, rgba(0, 229, 255, 0.25), rgba(157, 78, 221, 0.25));
-  --msg-in: rgba(22, 27, 42, 0.85);
-  --radius-lg: 16px;
-  --radius-md: 10px;
-  --radius-sm: 6px;
-  --shadow-main: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --glass-glow: rgba(0, 242, 254, 0.15);
+  --danger: #ff4d4d;
 }
 
-* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-
-body {
-  background: var(--bg-primary);
-  background-image: 
-    radial-gradient(at 10% 20%, rgba(157, 78, 221, 0.12) 0px, transparent 50%),
-    radial-gradient(at 90% 80%, rgba(0, 255, 136, 0.1) 0px, transparent 50%),
-    radial-gradient(at 50% 50%, rgba(0, 225, 255, 0.06) 0px, transparent 50%);
-  color: var(--text-main);
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  user-select: none;
-}
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; user-select: none; }
+body { background: var(--bg-dark); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; background-image: radial-gradient(circle at 50% 0%, rgba(79, 172, 254, 0.12), transparent 70%); }
 
 /* Titlebar */
-#titlebar {
-  height: 38px;
-  background: rgba(12, 15, 23, 0.9);
-  backdrop-filter: blur(12px);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 14px;
-  border-bottom: 1px solid var(--border-glass);
-  -webkit-app-region: drag;
-  flex-shrink: 0;
-  z-index: 100;
-}
-.title-left { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 600; color: var(--text-main); }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-emerald); box-shadow: 0 0 8px var(--accent-emerald); animation: pulse 2.5s infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.6; transform: scale(0.85); } }
+.titlebar { height: 38px; background: rgba(12, 14, 20, 0.9); display: flex; justify-content: space-between; align-items: center; padding: 0 14px; border-bottom: 1px solid var(--border-glass); -webkit-app-region: drag; }
+.titlebar-title { font-size: 13px; font-weight: 600; letter-spacing: 0.5px; background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.titlebar-controls { display: flex; gap: 8px; -webkit-app-region: no-drag; }
+.titlebar-btn { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; border: none; }
+.btn-close { background: #ff5f56; }
+.btn-min { background: #ffbd2e; }
+.btn-max { background: #27c93f; }
 
-.winctrls { display: flex; gap: 6px; -webkit-app-region: no-drag; }
-.winctrls button { width: 26px; height: 26px; border: none; border-radius: 6px; background: rgba(255,255,255,0.05); color: var(--text-muted); cursor: pointer; font-size: 12px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; }
-.winctrls button:hover { background: rgba(255,255,255,0.15); color: var(--text-main); }
-.winctrls button.x:hover { background: #ff4757; color: #fff; }
-
-#app { display: flex; flex: 1; overflow: hidden; position: relative; }
-
-/* Vault Lock Overlay Screen */
-#vault-lock-screen {
-  position: absolute;
-  inset: 0;
-  background: rgba(9, 11, 16, 0.94);
-  backdrop-filter: blur(25px);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-  transition: opacity 0.3s ease;
-}
-.vault-card {
-  background: var(--bg-glass);
-  border: 1px solid var(--border-glass);
-  border-radius: var(--radius-lg);
-  padding: 36px 40px;
-  width: 360px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 16px;
-  box-shadow: var(--shadow-main);
-  text-align: center;
-}
-.vault-icon { font-size: 36px; opacity: 0.9; }
-.vault-title { font-size: 19px; font-weight: 700; color: var(--text-main); }
-.vault-sub { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
-.vault-input {
-  width: 100%;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid var(--border-glass);
-  border-radius: var(--radius-md);
-  padding: 12px;
-  color: var(--accent-emerald);
-  font-size: 16px;
-  text-align: center;
-  letter-spacing: 4px;
-  outline: none;
-  transition: all 0.2s;
-}
-.vault-input:focus { border-color: var(--accent-emerald); box-shadow: 0 0 15px rgba(0, 255, 136, 0.15); }
-.btn-primary {
-  width: 100%;
-  padding: 12px;
-  border: none;
-  border-radius: var(--radius-md);
-  background: linear-gradient(135deg, var(--accent-emerald), var(--accent-cyan));
-  color: #000;
-  font-weight: 700;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.2s;
-  box-shadow: 0 4px 15px rgba(0, 255, 136, 0.2);
-}
-.btn-primary:hover { transform: translateY(-1px); filter: brightness(1.1); }
+/* Main App Container */
+.app-container { flex: 1; display: flex; overflow: hidden; position: relative; }
 
 /* Sidebar */
-#sidebar {
-  width: 280px;
-  background: var(--bg-glass);
-  backdrop-filter: blur(20px);
-  border-right: 1px solid var(--border-glass);
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-}
-.sidebar-top { padding: 14px 14px 10px; border-bottom: 1px solid var(--border-glass); }
-.my-id-card {
-  background: var(--bg-glass-card);
-  border: 1px solid var(--border-glass);
-  border-radius: var(--radius-md);
-  padding: 10px 12px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.my-id-card:hover { border-color: var(--accent-emerald); transform: translateY(-1px); }
-.my-id-name { font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; }
-.my-id-sub { font-size: 11px; color: var(--text-muted); font-family: monospace; margin-top: 2px; }
+.sidebar { width: 300px; background: var(--bg-panel); backdrop-filter: blur(16px); border-right: 1px solid var(--border-glass); display: flex; flex-direction: column; }
+.sidebar-header { padding: 16px; border-bottom: 1px solid var(--border-glass); display: flex; justify-content: space-between; align-items: center; }
+.user-badge { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.user-avatar { width: 36px; height: 36px; border-radius: 10px; background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); display: flex; align-items: center; justify-content: center; font-weight: 700; color: #000; font-size: 14px; }
+.user-info { display: flex; flex-direction: column; }
+.user-name { font-weight: 600; font-size: 14px; }
+.user-status { font-size: 11px; color: var(--accent-cyan); }
 
-/* Tabs */
-.tab-bar { display: flex; padding: 8px 10px; gap: 6px; border-bottom: 1px solid var(--border-glass); }
-.tab-btn { flex: 1; padding: 7px; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; font-size: 12px; font-weight: 600; transition: all 0.2s; }
-.tab-btn.active { background: rgba(0, 255, 136, 0.15); color: var(--accent-emerald); border: 1px solid var(--border-glow); }
+.contacts-header { padding: 12px 16px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
+.add-btn { background: none; border: none; color: var(--accent-cyan); font-size: 16px; cursor: pointer; }
 
-/* Contacts List */
-.conv-list { flex: 1; overflow-y: auto; padding: 6px; }
-.conv-item {
-  padding: 10px 12px;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 3px;
-  border: 1px solid transparent;
-}
-.conv-item:hover { background: rgba(255, 255, 255, 0.04); }
-.conv-item.active { background: rgba(0, 225, 255, 0.1); border-color: rgba(0, 225, 255, 0.3); }
-
-.conv-avatar { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; background: linear-gradient(135deg, var(--accent-purple), var(--accent-cyan)); }
-.conv-info { flex: 1; min-width: 0; }
-.conv-name { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.conv-preview { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-
-.sidebar-footer { padding: 10px; border-top: 1px solid var(--border-glass); display: flex; flex-direction: column; gap: 6px; }
-.footer-row { display: flex; gap: 6px; }
-.footer-btn { flex: 1; padding: 8px; border: 1px solid var(--border-glass); border-radius: var(--radius-sm); background: var(--bg-glass-card); color: var(--text-main); cursor: pointer; font-size: 11px; font-weight: 600; transition: all 0.2s; text-align: center; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.footer-btn:hover { border-color: var(--accent-emerald); color: var(--accent-emerald); }
+.contact-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 8px; }
+.contact-item { padding: 10px 12px; border-radius: 10px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; }
+.contact-item:hover { background: rgba(255, 255, 255, 0.04); border-color: var(--border-glass); }
+.contact-item.active { background: rgba(0, 242, 254, 0.08); border-color: rgba(0, 242, 254, 0.3); }
 
 /* Main Chat Area */
-#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; background: rgba(10, 13, 20, 0.4); }
-#empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text-muted); }
+.chat-area { flex: 1; display: flex; flex-direction: column; background: rgba(12, 14, 20, 0.4); }
+.chat-header { height: 60px; padding: 0 20px; border-bottom: 1px solid var(--border-glass); display: flex; align-items: center; justify-content: space-between; background: var(--bg-panel); backdrop-filter: blur(16px); }
+.chat-header-info { display: flex; align-items: center; gap: 12px; }
 
-#chat { flex: 1; display: none; flex-direction: column; overflow: hidden; }
-#chat-header { padding: 12px 20px; background: var(--bg-glass); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-glass); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-.ch-name { font-size: 14px; font-weight: 700; color: var(--text-main); }
-.ch-badge { background: rgba(0, 255, 136, 0.12); color: var(--accent-emerald); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; border: 1px solid rgba(0, 255, 136, 0.2); }
+.chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.msg-row { display: flex; flex-direction: column; max-width: 65%; }
+.msg-row.out { align-self: flex-end; align-items: flex-end; }
+.msg-row.in { align-self: flex-start; align-items: flex-start; }
 
-/* Message Stream */
-#messages { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 8px; }
-.msg-row { display: flex; align-items: flex-end; gap: 8px; animation: fadeIn 0.2s ease; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-.msg-row.out { flex-direction: row-reverse; }
-.msg-bubble { max-width: 65%; padding: 10px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; word-wrap: break-word; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
-.msg-row.in .msg-bubble { background: var(--msg-in); border: 1px solid var(--border-glass); border-bottom-left-radius: 4px; }
-.msg-row.out .msg-bubble { background: var(--msg-out); border: 1px solid rgba(0, 225, 255, 0.3); border-bottom-right-radius: 4px; }
+.msg-bubble { padding: 12px 16px; border-radius: 16px; font-size: 14px; line-height: 1.5; word-break: break-word; }
+.msg-row.out .msg-bubble { background: linear-gradient(135deg, #00c6ff, #0072ff); color: #fff; border-bottom-right-radius: 4px; }
+.msg-row.in .msg-bubble { background: var(--bg-card); border: 1px solid var(--border-glass); color: var(--text-main); border-bottom-left-radius: 4px; }
 
-/* Input Bar */
-#chat-input-bar { padding: 12px 18px; background: var(--bg-glass); backdrop-filter: blur(20px); border-top: 1px solid var(--border-glass); display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.input-field { flex: 1; background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-glass); border-radius: var(--radius-md); padding: 10px 14px; color: var(--text-main); font-size: 13px; outline: none; transition: all 0.2s; }
-.input-field:focus { border-color: var(--accent-emerald); }
+.chat-input-area { padding: 16px; background: var(--bg-panel); border-top: 1px solid var(--border-glass); display: flex; gap: 12px; align-items: center; }
+.chat-input { flex: 1; background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-glass); border-radius: 12px; padding: 12px 16px; color: var(--text-main); font-size: 14px; outline: none; transition: border-color 0.2s; }
+.chat-input:focus { border-color: var(--accent-cyan); }
+.btn-send { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; border: none; border-radius: 12px; padding: 12px 20px; font-weight: 600; cursor: pointer; transition: transform 0.1s; }
+.btn-send:active { transform: scale(0.96); }
 
-.tool-btn { width: 38px; height: 38px; border: 1px solid var(--border-glass); border-radius: var(--radius-md); background: var(--bg-glass-card); color: var(--text-main); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
-.tool-btn:hover { border-color: var(--accent-emerald); color: var(--accent-emerald); transform: scale(1.05); }
+/* Overlays / Modals */
+.modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(20px); display: flex; justify-content: center; align-items: center; z-index: 100; opacity: 1; transition: opacity 0.3s; }
+.modal-box { background: #161b26; border: 1px solid var(--border-glass); border-radius: 20px; padding: 28px; width: 420px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+.modal-title { font-size: 18px; font-weight: 700; text-align: center; }
+.input-field { background: rgba(0, 0, 0, 0.4); border: 1px solid var(--border-glass); border-radius: 10px; padding: 12px; color: var(--text-main); outline: none; font-size: 14px; width: 100%; }
+.btn-primary { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; border: none; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; width: 100%; }
 
-/* Drop Zone Overlay */
-#drop-zone { position: absolute; inset: 0; background: rgba(9, 11, 16, 0.88); backdrop-filter: blur(12px); border: 2px dashed var(--accent-emerald); display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px; z-index: 500; font-size: 14px; font-weight: 600; color: var(--accent-emerald); }
-
-/* Modals */
-.modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.75); backdrop-filter: blur(14px); display: none; align-items: center; justify-content: center; z-index: 600; }
-.modal-box { background: var(--bg-glass); border: 1px solid var(--border-glass); border-radius: var(--radius-lg); padding: 24px 28px; width: 380px; display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow-main); max-height: 90vh; overflow-y: auto; }
-.modal-title { font-size: 15px; font-weight: 700; color: var(--text-main); text-align: center; }
-
-/* Power User Inspector Console */
-#power-user-panel { display: none; background: rgba(0,0,0,0.4); border: 1px solid var(--border-glass); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 11px; color: var(--accent-cyan); max-height: 120px; overflow-y: auto; }
+/* Dropzone */
+.drop-overlay { position: absolute; inset: 0; background: rgba(0, 242, 254, 0.15); border: 2px dashed var(--accent-cyan); backdrop-filter: blur(10px); display: none; justify-content: center; align-items: center; font-weight: 700; font-size: 18px; z-index: 50; }
 </style>
 </head>
 <body>
 
-<div id="titlebar">
-  <div class="title-left">
-    <div class="status-dot"></div>
-    <span>Privacy Messenger 1.0.2</span>
-  </div>
-  <div class="winctrls">
-    <button onclick="window.electronAPI?.minimize()">—</button>
-    <button onclick="window.electronAPI?.maximize()">▢</button>
-    <button class="x" onclick="window.electronAPI?.close()">✕</button>
+<div class="titlebar">
+  <div class="titlebar-title">Privacy Messenger 🔐</div>
+  <div class="titlebar-controls">
+    <button class="titlebar-btn btn-min" onclick="window.electronAPI.minimize()"></button>
+    <button class="titlebar-btn btn-max" onclick="window.electronAPI.maximize()"></button>
+    <button class="titlebar-btn btn-close" onclick="window.electronAPI.quit()"></button>
   </div>
 </div>
 
-<div id="app">
-  <!-- Master Passphrase Vault Lock Screen -->
-  <div id="vault-lock-screen">
-    <div class="vault-card">
-      <div class="vault-icon">🔒</div>
-      <div class="vault-title">Tresor-Entsperrung</div>
-      <div class="vault-sub">Geben Sie Ihre Master-PIN ein, um den verschlüsselten Nachrichtenspeicher freizuschalten.</div>
-      <input type="password" id="vault-pin-input" class="vault-input" placeholder="••••" maxlength="32"/>
-      <button class="btn-primary" onclick="unlockVault()">Tresor Entsperren</button>
-      <div id="vault-status" style="font-size:11px; color:var(--accent-pink);"></div>
-    </div>
-  </div>
+<div class="app-container" id="main">
+  <!-- Dropzone for Drag-and-Drop file encryption -->
+  <div class="drop-overlay" id="drop-zone">📂 Datei für E2EE Verschlüsselung ablegen</div>
 
   <!-- Sidebar -->
-  <div id="sidebar">
-    <div class="sidebar-top">
-      <div class="my-id-card" onclick="openProfileModal()">
-        <div class="my-id-name">
-          <span id="my-name-display">Mein Profil</span>
-          <span style="font-size:11px; color:var(--accent-emerald); font-weight:600;">👤 Profil</span>
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <div class="user-badge" onclick="openProfileModal()">
+        <div class="user-avatar" id="user-avatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="user-name">Lade Profil...</div>
+          <div class="user-status" id="user-status">🔒 Sehr sicher (Double Ratchet)</div>
         </div>
-        <div class="my-id-sub" id="my-token-display">OM-8F4A-9B2C-7E1D</div>
       </div>
     </div>
 
-    <div class="tab-bar">
-      <button class="tab-btn active" id="tab-contacts" onclick="switchTab('contacts')">Kontakte</button>
-      <button class="tab-btn" id="tab-groups" onclick="switchTab('groups')">Gruppen</button>
-      <button class="tab-btn" id="tab-power" style="display:none; color:var(--accent-cyan);" onclick="switchTab('power')">⚡ Power Tools</button>
+    <div class="contacts-header">
+      <span>Kontakte</span>
+      <button class="add-btn" onclick="openAddContactModal()">➕</button>
     </div>
 
-    <div class="conv-list" id="conv-list">
-      <!-- Dynamic Contacts rendering -->
-    </div>
-
-    <div class="sidebar-footer">
-      <div class="footer-row">
-        <button class="footer-btn" style="background:rgba(0,255,136,0.12); border-color:var(--border-glow); color:var(--accent-emerald);" onclick="inviteFriend()">👥 Einladen</button>
-        <button class="footer-btn" onclick="openAddContactModal()">➕ Kontakt</button>
-      </div>
-      <div class="footer-row">
-        <button class="footer-btn" onclick="lockVault()">🔒 Sperren</button>
-      </div>
+    <div class="contact-list" id="contact-list">
+      <!-- Contacts populated via Backend -->
     </div>
   </div>
 
-  <!-- Main Chat Area -->
-  <div id="main">
-    <div id="drop-zone">
-      <div style="font-size:32px;">📁</div>
-      <div>Datei ablegen zum Verschlüsseln</div>
-    </div>
-
-    <div id="empty-state">
-      <div style="font-size:36px; opacity:0.3;">💬</div>
-      <div style="font-size:14px; font-weight:600; color:var(--text-main);">Keine Unterhaltung ausgewählt</div>
-      <p style="font-size:12px;">Wählen Sie einen Kontakt oder erstellen Sie eine neue Verbindung</p>
-      <small style="color:var(--text-dim); margin-top:4px;">Sehr sicher — AES-256-GCM + Double Ratchet E2EE</small>
-    </div>
-
-    <div id="chat">
-      <div id="chat-header">
-        <div class="conv-avatar" id="chat-avatar">A</div>
+  <!-- Main Chat -->
+  <div class="chat-area">
+    <div class="chat-header">
+      <div class="chat-header-info">
+        <div class="user-avatar" id="chat-target-avatar">👥</div>
         <div>
-          <div class="ch-name" id="chat-name">Alex</div>
-          <div style="font-size:11px; color:var(--text-muted);" id="chat-sub">Online — Signal Protocol</div>
+          <div style="font-weight:700; font-size:15px;" id="chat-target-name">Wähle einen Kontakt</div>
+          <div style="font-size:11px; color:var(--text-muted);" id="chat-ratchet-status">Double Ratchet Inaktiv</div>
         </div>
-        <div class="ch-badge">AES-256-GCM E2EE</div>
       </div>
+    </div>
 
-      <div id="messages"></div>
-
-      <div id="chat-input-bar">
-        <button class="tool-btn" title="Datei anhängen" onclick="triggerFileInput()">📎</button>
-        <button class="tool-btn" id="voice-btn" title="Audio aufnehmen" onclick="toggleVoiceRecord()">🎙️</button>
-        <input type="text" id="chat-msg-input" class="input-field" placeholder="Nachricht schreiben..." onkeydown="if(event.key==='Enter') sendChatMessage()"/>
-        <button class="btn-primary" style="width: auto; padding: 10px 18px;" onclick="sendChatMessage()">Senden</button>
+    <div class="chat-messages" id="messages">
+      <div style="text-align:center; color:var(--text-muted); margin-top:40px; font-size:13px;">
+        Wähle einen E2EE-Kontakt auf der linken Seite oder füge einen neuen hinzu.
       </div>
+    </div>
+
+    <div class="chat-input-area">
+      <input type="text" id="chat-msg-input" class="chat-input" placeholder="Verschlüsselte Nachricht eingeben..." onkeydown="if(event.key==='Enter') sendChatMessage()"/>
+      <button class="btn-send" onclick="sendChatMessage()">Senden 🚀</button>
     </div>
   </div>
 </div>
 
-<!-- My Privacy Profile Modal Overlay -->
-<div class="modal-overlay" id="profile-modal">
+<!-- Vault Lock Screen Overlay -->
+<div class="modal-overlay" id="vault-lock-screen">
   <div class="modal-box">
-    <div class="modal-title">Datenschutz-Profil</div>
-    <div style="font-size:12px; color:var(--text-muted); text-align:center;">Öffentlicher Schlüssel & Verbindungsparameter</div>
-    
-    <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; font-size:11px;">
-      <div style="color:var(--text-muted);">P2P Session Token:</div>
-      <div style="color:var(--accent-emerald); font-family:monospace; font-weight:700; margin-top:2px;" id="profile-token-val">OM-8F4A-9B2C-7E1D</div>
+    <div class="modal-title">🔐 Tresor Entsperren</div>
+    <div style="font-size:12px; color:var(--text-muted); text-align:center;">
+      Geben Sie Ihr Master-Passwort / PIN ein, um PBKDF2 Master-Keys im Backend freizuschalten.
     </div>
+    <input type="password" id="vault-pin-input" class="input-field" placeholder="Master PIN / Passwort" onkeydown="if(event.key==='Enter') handleUnlockVault()"/>
+    <button class="btn-primary" onclick="handleUnlockVault()">Tresor Entsperren</button>
+    <div id="vault-error" style="color:var(--danger); font-size:12px; text-align:center; display:none;">Falsches Passwort / PIN!</div>
+  </div>
+</div>
 
-    <button class="footer-btn" onclick="copyTokenToClipboard()">📋 Token Kopieren</button>
+<!-- Add Contact Modal -->
+<div class="modal-overlay" id="add-contact-modal" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-title">Neuer E2EE Kontakt</div>
+    <input type="text" id="add-name-input" class="input-field" placeholder="1. Name (z.B. Alex)"/>
+    <input type="text" id="add-userid-input" class="input-field" placeholder="2. User ID (b64)"/>
+    <input type="text" id="add-dh-input" class="input-field" placeholder="3. DH Public Key (b64)"/>
+    <button class="btn-primary" onclick="saveNewContact()">Kontakt Speichern</button>
+    <button class="input-field" style="cursor:pointer;" onclick="closeAddContactModal()">Abbrechen</button>
+  </div>
+</div>
 
-    <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; font-size:11px;">
-      <div style="color:var(--text-muted);">IP-Adresse (Streamer Protection):</div>
-      <div style="color:var(--accent-pink); font-family:monospace; font-weight:700; margin-top:2px;" id="profile-ip-val">••••••••••••••••</div>
-    </div>
-
-    <div style="display:flex; gap:6px;">
-      <button class="footer-btn" onclick="toggleIpVisibility()" id="btn-toggle-ip">IP Anzeigen</button>
-      <button class="footer-btn" onclick="copyIpToClipboard()">IP Kopieren</button>
-    </div>
-
-    <!-- Power User Mode Toggle Switch -->
-    <div style="background:rgba(0,229,255,0.06); border:1px solid rgba(0,229,255,0.15); padding:12px; border-radius:8px; margin-top:4px;">
-      <div style="display:flex; align-items:center; justify-content:space-between;">
-        <span style="font-size:12px; font-weight:700; color:var(--accent-cyan);">⚡ Power User Modus</span>
-        <input type="checkbox" id="power-mode-toggle" onchange="togglePowerMode()" style="accent-color:var(--accent-cyan); cursor:pointer; width:16px; height:16px;"/>
-      </div>
-      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; line-height:1.4;">
-        Schaltet erweiterte Krypto-Optionen, Custom Relays, Fingerprint-Prüfung und den Netzwerkinspektor frei.
-      </div>
-    </div>
-
-    <!-- Power User Extra Section (When enabled) -->
-    <div id="power-user-details" style="display:none; flex-direction:column; gap:8px;">
-      <div style="font-size:11px; color:var(--accent-cyan); font-weight:700;">Fingerprint: SHA-256: 4A:91:DE:0F:8B:3C</div>
-      <div style="font-size:11px; color:var(--text-muted);">Custom Relay WS: ws://127.0.0.1:49155</div>
-      <div id="power-user-panel">[SYS] Power User Log Inspector Active. WebSocket Relay Connected.</div>
-    </div>
-
+<!-- Profile Modal -->
+<div class="modal-overlay" id="profile-modal" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-title">Dein E2EE Profil</div>
+    <div style="font-size:12px; color:var(--accent-cyan); word-break:break-all;" id="profile-user-id">User ID: ...</div>
+    <div style="font-size:12px; color:var(--text-muted); word-break:break-all;" id="profile-fingerprint">Fingerprint: ...</div>
     <button class="btn-primary" onclick="closeProfileModal()">Schließen</button>
   </div>
 </div>
 
-<!-- Add Contact Modal Overlay -->
-<div class="modal-overlay" id="add-contact-modal">
-  <div class="modal-box">
-    <div class="modal-title">Neuer E2EE Kontakt</div>
-    <input type="text" id="add-name-input" class="input-field" placeholder="1. Name des Kontakts (z.B. Alex)"/>
-    <input type="text" id="add-token-input" class="input-field" placeholder="2. IP-Adresse oder Token (optional)"/>
-    <button class="btn-primary" onclick="saveNewContact()">Kontakt Speichern</button>
-    <button class="footer-btn" onclick="closeAddContactModal()">Abbrechen</button>
-  </div>
-</div>
-
 <script>
-let currentVaultUnlocked = false;
-let isIpMasked = true;
-let isPowerModeActive = false;
-const myIp = "192.168.1.15:25575";
-const myToken = "OM-8F4A-9B2C-7E1D";
+let currentActiveContactId = null;
+let activeIdentity = null;
 
-function unlockVault() {
-  const pin = document.getElementById('vault-pin-input').value;
-  if (!pin || pin.trim().length === 0) {
-    document.getElementById('vault-status').innerText = "Bitte geben Sie Ihre PIN ein.";
-    return;
+// Initialize App: Enforce Vault Check & Backend Integration
+async function initApp() {
+  try {
+    const vStatus = await window.messenger.getVaultStatus();
+    if (!vStatus.unlocked) {
+      document.getElementById('vault-lock-screen').style.display = 'flex';
+    } else {
+      document.getElementById('vault-lock-screen').style.display = 'none';
+      await loadAppContent();
+    }
+  } catch (err) {
+    console.error('Vault check failed:', err);
   }
-  currentVaultUnlocked = true;
-  document.getElementById('vault-lock-screen').style.opacity = '0';
-  setTimeout(() => {
-    document.getElementById('vault-lock-screen').style.display = 'none';
-  }, 300);
 }
 
-function lockVault() {
-  currentVaultUnlocked = false;
-  document.getElementById('vault-pin-input').value = '';
-  document.getElementById('vault-status').innerText = '';
-  document.getElementById('vault-lock-screen').style.display = 'flex';
-  document.getElementById('vault-lock-screen').style.opacity = '1';
+async function handleUnlockVault() {
+  const pin = document.getElementById('vault-pin-input').value;
+  document.getElementById('vault-error').style.display = 'none';
+  if (!pin) return;
+
+  try {
+    const res = await window.messenger.unlockVault(pin);
+    if (res && res.unlocked) {
+      document.getElementById('vault-lock-screen').style.display = 'none';
+      await loadAppContent();
+    } else {
+      document.getElementById('vault-error').style.display = 'block';
+    }
+  } catch (e) {
+    document.getElementById('vault-error').style.display = 'block';
+  }
+}
+
+async function loadAppContent() {
+  // Load or Create Identity
+  let idRes = await window.messenger.getIdentity();
+  if (!idRes.exists) {
+    idRes = await window.messenger.createIdentity("User-" + Math.floor(Math.random()*1000));
+  }
+  activeIdentity = idRes;
+  document.getElementById('user-name').innerText = activeIdentity.display_name || activeIdentity.user_id.substring(0, 8);
+  document.getElementById('user-avatar').innerText = (activeIdentity.display_name || 'U')[0].toUpperCase();
+  document.getElementById('profile-user-id').innerText = "User ID: " + activeIdentity.user_id;
+
+  const fp = await window.messenger.getFingerprint();
+  if (fp) {
+    document.getElementById('profile-fingerprint').innerText = "Fingerprint: SHA-256:" + fp.fingerprint.substring(0, 16).toUpperCase();
+  }
+
+  await loadContacts();
+
+  // Listen to incoming messages via WebSocket
+  window.messenger.connectWS((event) => {
+    if (event.type === 'new_message' && event.message) {
+      if (currentActiveContactId === event.message.conversation_id) {
+        appendMessageUI(event.message.content, false);
+      }
+    }
+  });
+}
+
+async function loadContacts() {
+  const contacts = await window.messenger.getContacts();
+  const listEl = document.getElementById('contact-list');
+  listEl.innerHTML = '';
+
+  if (contacts.length === 0) {
+    listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:8px;">Keine Kontakte.</div>';
+    return;
+  }
+
+  contacts.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'contact-item' + (c.user_id === currentActiveContactId ? ' active' : '');
+    item.onclick = () => selectContact(c);
+    item.innerHTML = `
+      <div class="user-avatar" style="width:30px; height:30px; font-size:12px;">${(c.display_name||'C')[0]}</div>
+      <div style="font-size:13px; font-weight:600;">${c.display_name || c.user_id.substring(0,8)}</div>
+    `;
+    listEl.appendChild(item);
+  });
+}
+
+async function selectContact(contact) {
+  currentActiveContactId = contact.user_id;
+  document.getElementById('chat-target-name').innerText = contact.display_name || contact.user_id.substring(0, 8);
+  
+  await loadContacts();
+  await loadMessages(contact.user_id);
+
+  // Check Double Ratchet status
+  const rInfo = await window.messenger.getRatchetInfo(contact.user_id);
+  if (rInfo.active) {
+    document.getElementById('chat-ratchet-status').innerText = `Double Ratchet Aktiv (Sent: ${rInfo.ns}, Recv: ${rInfo.nr})`;
+  } else {
+    document.getElementById('chat-ratchet-status').innerText = `Bereit für X3DH Handshake`;
+  }
+}
+
+async function loadMessages(contactId) {
+  const msgs = await window.messenger.getMessages(contactId);
+  const msgBox = document.getElementById('messages');
+  msgBox.innerHTML = '';
+
+  msgs.forEach(m => {
+    appendMessageUI(m.content, m.is_outgoing === 1);
+  });
+}
+
+function appendMessageUI(content, isOutgoing) {
+  const msgBox = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'msg-row ' + (isOutgoing ? 'out' : 'in');
+  row.innerHTML = `<div class="msg-bubble">${escapeHtml(content)}</div>`;
+  msgBox.appendChild(row);
+  msgBox.scrollTop = msgBox.scrollHeight;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-msg-input');
+  const text = input.value.trim();
+  if (!text || !currentActiveContactId) return;
+
+  // Real Backend E2EE Send Call
+  await window.messenger.sendMessage({ conversation_id: currentActiveContactId, content: text });
+  appendMessageUI(text, true);
+  input.value = '';
+}
+
+async function saveNewContact() {
+  const name = document.getElementById('add-name-input').value.trim();
+  const uid  = document.getElementById('add-userid-input').value.trim();
+  const dh   = document.getElementById('add-dh-input').value.trim();
+  if (!name || !uid || !dh) return;
+
+  await window.messenger.addContact({ user_id: uid, display_name: name, sign_pk: uid, dh_pk: dh });
+  closeAddContactModal();
+  await loadContacts();
 }
 
 function openProfileModal() { document.getElementById('profile-modal').style.display = 'flex'; }
@@ -408,66 +327,11 @@ function closeProfileModal() { document.getElementById('profile-modal').style.di
 function openAddContactModal() { document.getElementById('add-contact-modal').style.display = 'flex'; }
 function closeAddContactModal() { document.getElementById('add-contact-modal').style.display = 'none'; }
 
-function toggleIpVisibility() {
-  isIpMasked = !isIpMasked;
-  document.getElementById('profile-ip-val').innerText = isIpMasked ? '••••••••••••••••' : myIp;
-  document.getElementById('btn-toggle-ip').innerText = isIpMasked ? 'IP Anzeigen' : 'IP Verbergen';
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function togglePowerMode() {
-  isPowerModeActive = document.getElementById('power-mode-toggle').checked;
-  document.getElementById('power-user-details').style.display = isPowerModeActive ? 'flex' : 'none';
-  document.getElementById('tab-power').style.display = isPowerModeActive ? 'block' : 'none';
-}
-
-function inviteFriend() {
-  navigator.clipboard.writeText(myToken);
-  alert("Einladungs-Token (" + myToken + ") wurde in die Zwischenablage kopiert.");
-}
-
-function copyTokenToClipboard() {
-  navigator.clipboard.writeText(myToken);
-  alert("Token in Zwischenablage kopiert.");
-}
-
-function copyIpToClipboard() {
-  navigator.clipboard.writeText(myIp);
-  alert("IP-Adresse in Zwischenablage kopiert.");
-}
-
-function saveNewContact() {
-  const name = document.getElementById('add-name-input').value;
-  if (!name) return;
-  alert("Kontakt " + name + " erfolgreich hinzugefügt.");
-  closeAddContactModal();
-}
-
-function sendChatMessage() {
-  const input = document.getElementById('chat-msg-input');
-  if (!input.value.trim()) return;
-  const msgBox = document.getElementById('messages');
-  const row = document.createElement('div');
-  row.className = 'msg-row out';
-  row.innerHTML = `<div class="msg-bubble">${input.value.trim()}</div>`;
-  msgBox.appendChild(row);
-  input.value = '';
-  msgBox.scrollTop = msgBox.scrollHeight;
-}
-
-// Drag & Drop Handling
-const main = document.getElementById('main');
-const dropZone = document.getElementById('drop-zone');
-
-window.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.display = 'flex'; });
-dropZone.addEventListener('dragleave', () => { dropZone.style.display = 'none'; });
-dropZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dropZone.style.display = 'none';
-  if (e.dataTransfer.files.length > 0) {
-    const file = e.dataTransfer.files[0];
-    alert("Verschlüssele Datei: " + file.name + " (" + Math.round(file.size/1024) + " KB)");
-  }
-});
+window.onload = initApp;
 </script>
 </body>
 </html>

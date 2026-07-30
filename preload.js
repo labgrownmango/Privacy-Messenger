@@ -73,9 +73,9 @@ contextBridge.exposeInMainWorld('messenger', {
   exportBackup: () => apiFetch('/backup/export'),
   importBackup: (data_b64) => apiFetch('/backup/import', { method: 'POST', body: JSON.stringify({ data: data_b64 }) }),
 
-  // WebSocket with API Token Query Param
+  // WebSocket with Sec-WebSocket-Protocol Header Auth (removes Token from URL)
   connectWS: (onMessage) => {
-    const ws = new WebSocket(`ws://127.0.0.1:49155/ws?token=${API_TOKEN}`)
+    const ws = API_TOKEN ? new WebSocket('ws://127.0.0.1:49155/ws', [API_TOKEN]) : new WebSocket('ws://127.0.0.1:49155/ws')
     ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)) } catch {} }
     ws.onclose = () => setTimeout(() => window.messenger.connectWS(onMessage), 2000)
     return ws
