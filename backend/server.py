@@ -54,7 +54,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Real Outbound SOCKS5 & E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.3 — Real Outbound Network & Relay Transport")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -70,6 +70,7 @@ async def enforce_auth_token(request: Request, call_next):
     return await call_next(request)
 
 connected_ws: dict[str, WebSocket] = {}
+relay_writer_stream: Optional[asyncio.StreamWriter] = None
 
 # ─── SOCKS5 Proxy Configuration & Settings Management ─────────────────────────
 def load_settings() -> dict:
@@ -79,7 +80,7 @@ def load_settings() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050, "relay_url": ""}
+    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050, "relay_url": "ws://127.0.0.1:49156"}
 
 def save_settings(settings: dict):
     with open(SETTINGS_FILE, "w") as f:
@@ -144,27 +145,177 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
         logger.info(f"[Transport] Connecting directly to {dest_host}:{dest_port}")
         return await asyncio.open_connection(dest_host, dest_port)
 
-async def transmit_outbound_e2ee_packet(target_host: str, target_port: int, packet_dict: dict) -> bool:
+async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     """
-    Transmits real E2EE message packet over outbound network socket (direct or SOCKS5).
+    Transmits real E2EE message packet over outbound Relay Server or direct P2P socket.
     """
+    global relay_writer_stream
     settings = load_settings()
     proxy_enabled = settings.get("proxy_enabled", False)
     proxy_host = settings.get("proxy_host", "127.0.0.1")
     proxy_port = settings.get("proxy_port", 9050)
 
-    try:
-        reader, writer = await connect_tcp_or_socks5(target_host, target_port, proxy_enabled, proxy_host, proxy_port)
-        payload_bytes = json.dumps({"type": "incoming_e2ee_msg", "packet": packet_dict}).encode("utf-8") + b"\n"
-        writer.write(payload_bytes)
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-        logger.info(f"[Transport] Successfully transmitted E2EE packet to {target_host}:{target_port}")
-        return True
-    except Exception as e:
-        logger.error(f"[Transport] Outbound transmission failed: {e}")
-        return False
+    # 1. Check if recipient has direct P2P host/port in contacts DB
+    with get_db(CONTACTS_DB) as db:
+        contact = db.execute("SELECT * FROM contacts WHERE user_id=?", (recipient_id,)).fetchone()
+    
+    if contact and contact["host"] and contact["port"]:
+        dest_host = contact["host"]
+        dest_port = contact["port"]
+        logger.info(f"[Transport] Attempting direct P2P transmission to {dest_host}:{dest_port}")
+        try:
+            reader, writer = await connect_tcp_or_socks5(dest_host, dest_port, proxy_enabled, proxy_host, proxy_port)
+            # Post HTTP JSON request to receiver's /messages/receive endpoint
+            body = json.dumps(packet_dict).encode("utf-8")
+            http_req = (
+                f"POST /messages/receive HTTP/1.1\r\n"
+                f"Host: {dest_host}:{dest_port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("utf-8") + body
+
+            writer.write(http_req)
+            await writer.drain()
+            resp = await reader.read(1024)
+            writer.close()
+            await writer.wait_closed()
+
+            if b"200 OK" in resp or b"\"ok\":true" in resp or b"\"ok\": true" in resp:
+                logger.info(f"[Transport] Direct P2P packet delivered successfully to {recipient_id}")
+                return True
+        except Exception as e:
+            logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
+
+    # 2. Transmit via Active Relay Stream
+    if relay_writer_stream and not relay_writer_stream.is_closing():
+        try:
+            payload = json.dumps({"recipient_id": recipient_id, "packet": packet_dict})
+            # Send WebSocket text frame over stream
+            payload_bytes = payload.encode("utf-8")
+            length = len(payload_bytes)
+            
+            # WebSocket client frame header (masked)
+            header = bytearray([0x81]) # Fin bit + Text frame (0x1)
+            mask_key = secrets.token_bytes(4)
+            if length < 126:
+                header.append(0x80 | length)
+            elif length < 65536:
+                header.append(0x80 | 126)
+                header.extend(length.to_bytes(2, "big"))
+            else:
+                header.append(0x80 | 127)
+                header.extend(length.to_bytes(8, "big"))
+            
+            header.extend(mask_key)
+            masked_payload = bytearray(length)
+            for i in range(length):
+                masked_payload[i] = payload_bytes[i] ^ mask_key[i % 4]
+            
+            relay_writer_stream.write(header + masked_payload)
+            await relay_writer_stream.drain()
+            logger.info(f"[Transport] Transmitted E2EE packet for {recipient_id} via Relay Server")
+            return True
+        except Exception as e:
+            logger.error(f"[Transport] Failed to transmit packet over Relay stream: {e}")
+
+    logger.warning(f"[Transport] Packet for {recipient_id} queued (No active Relay or P2P route available)")
+    return False
+
+# ─── Outbound Background Relay Client Worker ──────────────────────────────────
+async def start_relay_client_worker():
+    global relay_writer_stream
+    await asyncio.sleep(2) # Allow server startup
+    
+    while True:
+        try:
+            identity = get_identity()
+            settings = load_settings()
+            relay_url = settings.get("relay_url", "").strip()
+
+            if identity and relay_url:
+                my_user_id = identity["user_id"]
+                proxy_enabled = settings.get("proxy_enabled", False)
+                proxy_host = settings.get("proxy_host", "127.0.0.1")
+                proxy_port = settings.get("proxy_port", 9050)
+
+                # Parse ws://host:port/relay
+                clean_url = relay_url.replace("ws://", "").replace("wss://", "")
+                parts = clean_url.split("/")
+                host_port = parts[0].split(":")
+                r_host = host_port[0]
+                r_port = int(host_port[1]) if len(host_port) > 1 else 49156
+
+                logger.info(f"[RelayWorker] Connecting to Relay Server {r_host}:{r_port} as user {my_user_id}...")
+                reader, writer = await connect_tcp_or_socks5(r_host, r_port, proxy_enabled, proxy_host, proxy_port)
+
+                # Send WebSocket Handshake
+                handshake = (
+                    f"GET /relay/{urllib.parse.quote(my_user_id)} HTTP/1.1\r\n"
+                    f"Host: {r_host}:{r_port}\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {b64e(secrets.token_bytes(16))}\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("utf-8")
+
+                writer.write(handshake)
+                await writer.drain()
+
+                # Read handshake HTTP response
+                resp = await reader.readuntil(b"\r\n\r\n")
+                if b"101" in resp or b"Switching Protocols" in resp:
+                    logger.info(f"[RelayWorker] Connected & registered on Relay Server as {my_user_id}")
+                    relay_writer_stream = writer
+
+                    while not reader.at_eof():
+                        # Read WebSocket frame header
+                        head = await reader.read(2)
+                        if len(head) < 2: break
+                        
+                        pay_len = head[1] & 0x7F
+                        if pay_len == 126:
+                            len_bytes = await reader.read(2)
+                            pay_len = int.from_bytes(len_bytes, "big")
+                        elif pay_len == 127:
+                            len_bytes = await reader.read(8)
+                            pay_len = int.from_bytes(len_bytes, "big")
+                        
+                        is_masked = bool(head[1] & 0x80)
+                        mask = await reader.read(4) if is_masked else b""
+                        raw_payload = await reader.read(pay_len)
+
+                        if is_masked:
+                            unmasked = bytearray(pay_len)
+                            for i in range(pay_len):
+                                unmasked[i] = raw_payload[i] ^ mask[i % 4]
+                            payload_str = unmasked.decode("utf-8")
+                        else:
+                            payload_str = raw_payload.decode("utf-8")
+
+                        try:
+                            msg_data = json.loads(payload_str)
+                            if msg_data.get("type") == "incoming_e2ee_packet" and "packet" in msg_data:
+                                p = msg_data["packet"]
+                                incoming = IncomingMsg(
+                                    id=p["id"],
+                                    sender_id=p["sender_id"],
+                                    header=p["header"],
+                                    ciphertext=p["ciphertext"],
+                                    msg_type=p.get("msg_type", "text"),
+                                    timestamp=p.get("timestamp", int(time.time()))
+                                )
+                                api_receive_message(incoming)
+                        except Exception as ex:
+                            logger.warning(f"[RelayWorker] Error processing incoming relay packet: {ex}")
+                else:
+                    logger.warning(f"[RelayWorker] Relay Handshake rejected: {resp[:100]}")
+
+        except Exception as e:
+            logger.warning(f"[RelayWorker] Relay connection lost: {e}. Reconnecting in 10s...")
+            relay_writer_stream = None
+        
+        await asyncio.sleep(10)
 
 # ─── Functional At-Rest Storage Encryption Vault ──────────────────────────────
 VAULT_MASTER_KEY: Optional[bytes] = None
@@ -278,6 +429,7 @@ def init_dbs():
         db.execute("""CREATE TABLE IF NOT EXISTS contacts (
             user_id TEXT PRIMARY KEY, display_name TEXT DEFAULT '',
             sign_pk TEXT, dh_pk TEXT, trust_level TEXT DEFAULT 'unverified',
+            host TEXT DEFAULT NULL, port INTEGER DEFAULT NULL,
             added_at INTEGER)""")
         db.commit()
 
@@ -311,6 +463,13 @@ def migrate():
         cols = [r[1] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
         if "auto_delete_at" not in cols:
             db.execute("ALTER TABLE messages ADD COLUMN auto_delete_at INTEGER DEFAULT NULL")
+            db.commit()
+
+    with get_db(CONTACTS_DB) as db:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(contacts)").fetchall()]
+        if "host" not in cols:
+            db.execute("ALTER TABLE contacts ADD COLUMN host TEXT DEFAULT NULL")
+            db.execute("ALTER TABLE contacts ADD COLUMN port INTEGER DEFAULT NULL")
             db.commit()
 migrate()
 
@@ -399,6 +558,8 @@ class AddContactReq(BaseModel):
     display_name: str = ""
     sign_pk: str
     dh_pk: str
+    host: Optional[str] = None
+    port: Optional[int] = None
 
 @app.get("/contacts")
 def api_get_contacts():
@@ -410,8 +571,8 @@ def api_get_contacts():
 def api_add_contact(req: AddContactReq):
     with get_db(CONTACTS_DB) as db:
         db.execute(
-            "INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, added_at) VALUES (?,?,?,?,?)",
-            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, int(time.time()))
+            "INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, host, port, added_at) VALUES (?,?,?,?,?,?,?)",
+            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.host, req.port, int(time.time()))
         )
         db.commit()
     return {"ok": True}
@@ -525,13 +686,6 @@ async def api_send_message(req: SendMsgReq):
     payload_b64 = b64e(json.dumps({"header": header, "ct": ciphertext_b64}).encode())
     enc_content = vault_encrypt(req.content)
 
-    with get_db(MSGS_DB) as db:
-        db.execute(
-            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
-            (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now)
-        )
-        db.commit()
-
     # Transmit E2EE message packet over Outbound Network Transport
     packet = {
         "id": msg_id,
@@ -542,14 +696,24 @@ async def api_send_message(req: SendMsgReq):
         "timestamp": now
     }
     
-    # Broadcast to local connected UI frontend
+    delivered = await transmit_outbound_e2ee_packet(req.conversation_id, packet)
+    initial_status = "sent" if delivered else "queued"
+
+    with get_db(MSGS_DB) as db:
+        db.execute(
+            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,1,?)",
+            (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now, initial_status)
+        )
+        db.commit()
+
+    # Broadcast confirmation to local UI frontend
     if "frontend" in connected_ws:
         try:
-            await connected_ws["frontend"].send_json({"type": "sent_message_confirm", "msg_id": msg_id})
+            await connected_ws["frontend"].send_json({"type": "sent_message_confirm", "msg_id": msg_id, "status": initial_status})
         except Exception:
             pass
 
-    return {"ok": True, "id": msg_id, "timestamp": now, "payload": payload_b64, "header": header, "ciphertext": ciphertext_b64}
+    return {"ok": True, "id": msg_id, "status": initial_status, "timestamp": now, "payload": payload_b64}
 
 @app.post("/messages/receive")
 def api_receive_message(req: IncomingMsg):
@@ -803,14 +967,22 @@ async def connect_relay(req: RelayConnectReq):
     if req.urls:
         settings["relay_url"] = req.urls[0]
         save_settings(settings)
+        # Re-trigger background worker
+        asyncio.create_task(start_relay_client_worker())
     return {"ok": True, "connected": req.urls, "active_relay": settings.get("relay_url")}
 
 @app.get("/relay/status")
 def relay_status():
     settings = load_settings()
-    return {"connected": True, "relay_url": settings.get("relay_url")}
+    is_connected = relay_writer_stream is not None and not relay_writer_stream.is_closing()
+    return {"connected": is_connected, "relay_url": settings.get("relay_url")}
 
-# ─── WebSocket (frontend & incoming network packets) ─────────────────────────
+# ─── Startup Background Workers ───────────────────────────────────────────────
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(start_relay_client_worker())
+
+# ─── WebSocket (frontend UI) ──────────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     token = ws.query_params.get("token") or ws.headers.get("sec-websocket-protocol")
@@ -823,22 +995,7 @@ async def ws_endpoint(ws: WebSocket):
     connected_ws["frontend"] = ws
     try:
         while True:
-            msg_text = await ws.receive_text()
-            try:
-                data = json.loads(msg_text)
-                if data.get("type") == "relay_message" and "message" in data:
-                    m = data["message"]
-                    incoming = IncomingMsg(
-                        id=m["id"],
-                        sender_id=m["sender_id"],
-                        header=m["header"],
-                        ciphertext=m["ciphertext"],
-                        msg_type=m.get("msg_type", "text"),
-                        timestamp=m.get("timestamp", int(time.time()))
-                    )
-                    api_receive_message(incoming)
-            except Exception as e:
-                logger.warning(f"Failed to process incoming WebSocket payload: {e}")
+            await ws.receive_text()
     except WebSocketDisconnect:
         connected_ws.pop("frontend", None)
 
