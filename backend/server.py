@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.1.0 — Anti-Squatting Shared-Secret Initial Delivery Tokens")
+app = FastAPI(title="Privacy Messenger v1.1.1 — Independent Static-ECDH Initial Delivery Tokens")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -166,13 +166,16 @@ async def register_delivery_token_on_relay(token: str):
         except Exception as e:
             logger.warning(f"[RelayWorker] Failed to register rotated token: {e}")
 
-def derive_shared_secret_initial_token(shared_secret: bytes) -> str:
+def derive_static_ecdh_initial_token(my_dh_sk_bytes: bytes, their_dh_pk_bytes: bytes) -> str:
     """
-    Cryptographically derives an initial 32-byte Delivery Token from the X3DH Shared Master Secret.
-    Prevents Token-Squatting attacks because ONLY Alice and Bob know shared_secret.
-    Third parties with only public keys cannot predict or register this token.
+    Derives an initial 32-byte Delivery Token from a static ECDH shared key between long-term identity keys.
+    Independently computable by BOTH Alice and Bob prior to exchanging any messages!
+    Third parties with only public keys CANNOT predict or register this token.
     """
-    return b64e(hashlib.sha256(shared_secret + b"pm-shared-secret-initial-token-v1").digest())
+    sk = nacl.public.PrivateKey(my_dh_sk_bytes)
+    pk = nacl.public.PublicKey(their_dh_pk_bytes)
+    static_shared_secret = bytes(nacl.public.Box(sk, pk).shared_key())
+    return b64e(hashlib.sha256(static_shared_secret + b"pm-static-initial-token-v1").digest())
 
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     global relay_writer_stream
@@ -211,11 +214,15 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # Anti-Squatting Delivery Token (Derived from shared secret or active contact delivery token)
+    # Static-ECDH Initial Delivery Token Derivation if no rotated token exists
+    id_data = get_identity()
     if contact and contact["delivery_token"]:
         recipient_delivery_token = contact["delivery_token"]
+    elif contact and contact["dh_pk"] and id_data:
+        my_dh_sk_bytes = b64d(id_data["dh_sk"])
+        their_dh_pk_bytes = b64d(contact["dh_pk"])
+        recipient_delivery_token = derive_static_ecdh_initial_token(my_dh_sk_bytes, their_dh_pk_bytes)
     else:
-        # Fallback to random 32-byte token
         recipient_delivery_token = b64e(secrets.token_bytes(32))
 
     if relay_writer_stream and not relay_writer_stream.is_closing():
@@ -644,11 +651,17 @@ def api_get_contacts():
 
 @app.post("/contacts")
 def api_add_contact(req: AddContactReq):
+    id_data = get_identity()
+    token = req.delivery_token
+    if not token and id_data:
+        # Derive initial delivery token from static ECDH shared key
+        token = derive_static_ecdh_initial_token(b64d(id_data["dh_sk"]), b64d(req.dh_pk))
+
     with get_db(CONTACTS_DB) as db:
         db.execute(
             """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, req.delivery_token, req.host, req.port, int(time.time()))
+            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, token, req.host, req.port, int(time.time()))
         )
         db.commit()
     return {"ok": True}
@@ -708,9 +721,9 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_hea
         else:
             shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
 
-        # Anti-Squatting Initial Delivery Token derived from Shared Secret (Zero Knowledge to third parties)
+        # Populate static ECDH initial delivery token if not set
         if not contact["delivery_token"]:
-            initial_token = derive_shared_secret_initial_token(shared_secret)
+            initial_token = derive_static_ecdh_initial_token(b64d(id_data["dh_sk"]), b64d(contact["dh_pk"]))
             with get_db(CONTACTS_DB) as c_db:
                 c_db.execute("UPDATE contacts SET delivery_token=? WHERE user_id=?", (initial_token, contact_id))
                 c_db.commit()

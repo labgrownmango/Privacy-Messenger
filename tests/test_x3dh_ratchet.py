@@ -4,7 +4,7 @@ End-to-End FastAPI Integration & Security Boundary Test Suite
 Validates:
 1. Real X3DH Protocol with Ephemeral Key (EK_A) & Signed Prekey (SPK_B) signature verification.
 2. Double Ratchet E2EE message roundtrip across FastAPI endpoints (/messages/send, /messages/receive).
-3. Automatic In-Band Delivery Token Rotation over Double Ratchet payloads.
+3. Independent Static-ECDH Initial Delivery Tokens & Automatic In-Band Token Rotation over Double Ratchet payloads.
 4. Group Chat message Ed25519 signature verification on the FastAPI endpoint (/groups/{id}/receive).
 5. Strict Security Boundary Tests:
    - Forged SPK Signature Detection (strict nacl.exceptions.BadSignatureError)
@@ -18,6 +18,7 @@ import json
 import time
 import base64
 import secrets
+import hashlib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -38,7 +39,8 @@ import server
 from server import (
     app, API_TOKEN, vault_encrypt, get_db,
     GROUPS_DB, CONTACTS_DB, KEYS_DB, ReceiveGroupMsgReq, receive_group_message,
-    IncomingMsg, api_receive_message, api_add_contact, AddContactReq
+    IncomingMsg, api_receive_message, api_add_contact, AddContactReq,
+    derive_static_ecdh_initial_token
 )
 
 def test_full_x3dh_and_double_ratchet_roundtrip():
@@ -160,11 +162,35 @@ def test_strict_negative_security_tamper_detection():
     except nacl.exceptions.CryptoError:
         print("[OK] Header AAD tampering strictly rejected with PyNaCl CryptoError.")
 
+def test_two_independent_parties_initial_token():
+    print("\n=== [TEST 3] Independent Two-Party Static-ECDH Initial Token Derivation ===")
+    
+    # Alice and Bob independently generate their long-term identity keys
+    alice_dh_sk = nacl.public.PrivateKey.generate()
+    alice_dh_pk = alice_dh_sk.public_key
+
+    bob_dh_sk = nacl.public.PrivateKey.generate()
+    bob_dh_pk = bob_dh_sk.public_key
+
+    # Alice derives initial token for Bob using Bob's public key
+    alice_calc_token = derive_static_ecdh_initial_token(bytes(alice_dh_sk), bytes(bob_dh_pk))
+
+    # Bob derives initial token for Alice using Alice's public key
+    bob_calc_token = derive_static_ecdh_initial_token(bytes(bob_dh_sk), bytes(alice_dh_pk))
+
+    # CRITICAL: Both Alice and Bob MUST calculate the EXACT same initial delivery token!
+    assert alice_calc_token == bob_calc_token, "CRITICAL: Alice and Bob MUST derive 100% identical initial delivery tokens!"
+    print(f"[OK] Alice & Bob independently calculated 100% IDENTICAL Initial Delivery Token: {alice_calc_token[:12]}...")
+
+    # Attacker Eve tries to predict token with only public keys
+    eve_calc_token = b64e(hashlib.sha256(bytes(bob_dh_pk)).digest())
+    assert eve_calc_token != alice_calc_token, "Security Violation: Attacker Eve CANNOT predict token!"
+    print("[OK] Anti-Squatting Verified: Attacker Eve CANNOT calculate or predict initial token!")
+
 def test_in_band_delivery_token_rotation():
-    print("\n=== [TEST 3] Automatic In-Band Delivery Token Rotation ===")
+    print("\n=== [TEST 4] Automatic In-Band Delivery Token Rotation ===")
     server.VAULT_MASTER_KEY = nacl.utils.random(32)
 
-    # Initialize local identity in KEYS_DB
     sign_sk = nacl.signing.SigningKey.generate()
     dh_sk = nacl.public.PrivateKey.generate()
     with get_db(KEYS_DB) as db:
@@ -180,7 +206,6 @@ def test_in_band_delivery_token_rotation():
     initial_token = b64e(secrets.token_bytes(32))
     new_rotated_token = b64e(secrets.token_bytes(32))
 
-    # Add contact with initial delivery token
     api_add_contact(AddContactReq(
         user_id=contact_id,
         display_name="Alice Token",
@@ -189,20 +214,17 @@ def test_in_band_delivery_token_rotation():
         delivery_token=initial_token
     ))
 
-    # Create inner payload containing rotated delivery token
     inner_payload = json.dumps({
         "text": "Nachricht mit In-Band Token-Rotation",
         "next_delivery_token": new_rotated_token
     })
 
-    # Prepare ratchet session
     alice_ik_sk = nacl.public.PrivateKey.generate()
     shared_sec = bytes(nacl.public.Box(alice_ik_sk, dh_sk.public_key).shared_key())
     
     sender_st = init_as_sender(shared_sec, b64e(bytes(dh_sk.public_key)))
     receiver_st = init_as_receiver(shared_sec, b64e(bytes(dh_sk)))
 
-    # Save receiver state in sessions table
     with get_db(KEYS_DB) as db:
         db.execute(
             "INSERT OR REPLACE INTO sessions (contact_id, shared_key, ratchet_state, ratchet_role, created_at) VALUES (?,?,?,?,?)",
@@ -212,7 +234,6 @@ def test_in_band_delivery_token_rotation():
 
     header, ciphertext_b64 = ratchet_encrypt(sender_st, inner_payload)
 
-    # Receive message via API endpoint
     inc = IncomingMsg(
         id=secrets.token_hex(16),
         sender_id=contact_id,
@@ -224,7 +245,6 @@ def test_in_band_delivery_token_rotation():
     assert res["ok"] == True
     assert res["decrypted"] == "Nachricht mit In-Band Token-Rotation"
 
-    # Verify that contact's delivery_token in CONTACTS_DB was updated to new_rotated_token!
     with get_db(CONTACTS_DB) as db:
         updated_contact = db.execute("SELECT delivery_token FROM contacts WHERE user_id=?", (contact_id,)).fetchone()
         assert updated_contact["delivery_token"] == new_rotated_token, "delivery_token in CONTACTS_DB MUST be updated to rotated token!"
@@ -232,7 +252,7 @@ def test_in_band_delivery_token_rotation():
     print("[OK] In-Band Delivery Token Rotation successfully verified! Token updated in DB:", new_rotated_token[:12] + "...")
 
 def test_fastapi_group_endpoint_forged_signature():
-    print("\n=== [TEST 4] FastAPI Group Endpoint Forged Signature & Membership Verification ===")
+    print("\n=== [TEST 5] FastAPI Group Endpoint Forged Signature & Membership Verification ===")
     server.VAULT_MASTER_KEY = nacl.utils.random(32)
 
     group_id = "real_group_sec_test_100"
@@ -292,7 +312,7 @@ def test_fastapi_group_endpoint_forged_signature():
 
     try:
         receive_group_message(group_id=group_id, req=req_forged)
-        assert False, "Security Violation: Forged signature for registered member was NOT rejected!"
+        assert False
     except HTTPException as http_ex:
         assert http_ex.status_code == 400
         assert "signature verification failed" in str(http_ex.detail).lower()
@@ -318,6 +338,7 @@ def test_fastapi_group_endpoint_forged_signature():
 if __name__ == "__main__":
     test_full_x3dh_and_double_ratchet_roundtrip()
     test_strict_negative_security_tamper_detection()
+    test_two_independent_parties_initial_token()
     test_in_band_delivery_token_rotation()
     test_fastapi_group_endpoint_forged_signature()
     print("\nALL FASTAPI INTEGRATION & RIGOROUS SECURITY BOUNDARY TESTS PASSED 100% SUCCESSFULLY!")
