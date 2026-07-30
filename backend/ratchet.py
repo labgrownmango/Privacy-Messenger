@@ -1,10 +1,12 @@
 """
-Double Ratchet Algorithm
-========================
-Based on Signal's Double Ratchet specification.
-Provides Forward Secrecy + Post-Compromise Security.
+Double Ratchet & X3DH Algorithm
+===============================
+Based on Signal's Double Ratchet and X3DH (Extended Triple Diffie-Hellman) specifications.
+Provides Forward Secrecy, Post-Compromise Security, and Cryptographic Deniability.
 
-Reference: https://signal.org/docs/specifications/doubleratchet/
+References:
+- https://signal.org/docs/specifications/doubleratchet/
+- https://signal.org/docs/specifications/x3dh/
 """
 import base64
 import hashlib
@@ -14,6 +16,7 @@ import struct
 from typing import Dict, Optional, Tuple
 
 import nacl.public
+import nacl.signing
 import nacl.secret
 import nacl.utils
 import nacl.bindings
@@ -60,6 +63,58 @@ def kdf_ck(ck: bytes) -> Tuple[bytes, bytes]:
 def _dh(sk: nacl.public.PrivateKey, pk: nacl.public.PublicKey) -> bytes:
     """X25519 DH exchange."""
     return bytes(nacl.public.Box(sk, pk).shared_key())
+
+
+# ─── Real X3DH Protocol (Extended Triple Diffie-Hellman) ─────────────────────
+def x3dh_sender_derive(
+    alice_ik_sk: nacl.public.PrivateKey,
+    bob_ik_pk: nacl.public.PublicKey,
+    bob_spk_pk: nacl.public.PublicKey,
+    bob_spk_sig: bytes,
+    bob_sign_pk: nacl.signing.VerifyKey,
+    bob_opk_pk: Optional[nacl.public.PublicKey] = None
+) -> Tuple[bytes, nacl.public.PrivateKey]:
+    """
+    Perform X3DH (Extended Triple Diffie-Hellman) as Sender (Alice).
+    1. Verify Bob's Signed Prekey (SPK_B) signature using Bob's Signing Identity Key.
+    2. Generate Alice's Ephemeral Keypair (EK_A).
+    3. Compute DH1 = DH(IK_A, SPK_B), DH2 = DH(EK_A, IK_B), DH3 = DH(EK_A, SPK_B), and optional DH4 = DH(EK_A, OPK_B).
+    4. Derive Master Shared Secret via HKDF.
+    Returns (shared_secret, ek_a).
+    """
+    # Signature Verification of Signed Prekey
+    bob_sign_pk.verify(bytes(bob_spk_pk), bob_spk_sig)
+
+    ek_a = nacl.public.PrivateKey.generate()
+    dh1 = _dh(alice_ik_sk, bob_spk_pk)
+    dh2 = _dh(ek_a, bob_ik_pk)
+    dh3 = _dh(ek_a, bob_spk_pk)
+    dh4 = _dh(ek_a, bob_opk_pk) if bob_opk_pk else b""
+
+    master_ikm = dh1 + dh2 + dh3 + dh4
+    shared_secret = _hkdf(master_ikm, b"", b"pm-x3dh-protocol-v1", 32)
+    return shared_secret, ek_a
+
+
+def x3dh_receiver_derive(
+    bob_ik_sk: nacl.public.PrivateKey,
+    bob_spk_sk: nacl.public.PrivateKey,
+    alice_ik_pk: nacl.public.PublicKey,
+    alice_ek_pk: nacl.public.PublicKey,
+    bob_opk_sk: Optional[nacl.public.PrivateKey] = None
+) -> bytes:
+    """
+    Perform X3DH (Extended Triple Diffie-Hellman) as Receiver (Bob).
+    Computes DH1 = DH(SPK_B, IK_A), DH2 = DH(IK_B, EK_A), DH3 = DH(SPK_B, EK_A), and optional DH4 = DH(OPK_B, EK_A).
+    Derives identical Master Shared Secret.
+    """
+    dh1 = _dh(bob_spk_sk, alice_ik_pk)
+    dh2 = _dh(bob_ik_sk, alice_ek_pk)
+    dh3 = _dh(bob_spk_sk, alice_ek_pk)
+    dh4 = _dh(bob_opk_sk, alice_ek_pk) if bob_opk_sk else b""
+
+    master_ikm = dh1 + dh2 + dh3 + dh4
+    return _hkdf(master_ikm, b"", b"pm-x3dh-protocol-v1", 32)
 
 
 # ─── Padding ──────────────────────────────────────────────────────────────────
