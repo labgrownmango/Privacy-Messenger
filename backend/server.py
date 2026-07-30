@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.5 — Full X3DH & Verified Group Signatures")
+app = FastAPI(title="Privacy Messenger v1.0.6 — True Signal-Style Sealed Sender")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -150,7 +150,7 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
 
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     """
-    Transmits real E2EE message packet over outbound Relay Server or direct P2P socket.
+    Transmits real E2EE message packet using True Signal-Style Sealed Sender Anonymous Delivery Tokens.
     """
     global relay_writer_stream
     settings = load_settings()
@@ -158,7 +158,7 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
     proxy_host = settings.get("proxy_host", "127.0.0.1")
     proxy_port = settings.get("proxy_port", 9050)
 
-    # 1. Check if recipient has direct P2P host/port in contacts DB
+    # 1. Check if recipient has direct P2P host/port or delivery_token in contacts DB
     with get_db(CONTACTS_DB) as db:
         contact = db.execute("SELECT * FROM contacts WHERE user_id=?", (recipient_id,)).fetchone()
     
@@ -189,10 +189,17 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # 2. Transmit via Active Relay Stream
+    # 2. Transmit via Active Relay Stream using Anonymous Delivery Token (True Sealed Sender)
+    recipient_delivery_token = contact["delivery_token"] if (contact and contact["delivery_token"]) else recipient_id
+
     if relay_writer_stream and not relay_writer_stream.is_closing():
         try:
-            payload = json.dumps({"recipient_id": recipient_id, "packet": packet_dict})
+            # Address outer envelope ONLY to anonymous delivery_token
+            payload = json.dumps({
+                "type": "sealed_packet",
+                "delivery_token": recipient_delivery_token,
+                "packet": packet_dict
+            })
             payload_bytes = payload.encode("utf-8")
             length = len(payload_bytes)
             
@@ -214,15 +221,15 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
             
             relay_writer_stream.write(header + masked_payload)
             await relay_writer_stream.drain()
-            logger.info(f"[Transport] Transmitted E2EE packet for {recipient_id} via Relay Server")
+            logger.info(f"[Transport] Transmitted Sealed E2EE packet to delivery token {recipient_delivery_token[:8]}...")
             return True
         except Exception as e:
-            logger.error(f"[Transport] Failed to transmit packet over Relay stream: {e}")
+            logger.error(f"[Transport] Failed to transmit sealed packet over Relay stream: {e}")
 
     logger.warning(f"[Transport] Packet for {recipient_id} queued (No active Relay or P2P route available)")
     return False
 
-# ─── Outbound Background Relay Client Worker ──────────────────────────────────
+# ─── Outbound Background Relay Client Worker (True Sealed Sender) ──────────────
 async def start_relay_client_worker():
     global relay_writer_stream
     await asyncio.sleep(2)
@@ -234,7 +241,7 @@ async def start_relay_client_worker():
             relay_url = settings.get("relay_url", "").strip()
 
             if identity and relay_url:
-                my_user_id = identity["user_id"]
+                my_delivery_token = identity.get("delivery_token") or identity["user_id"]
                 proxy_enabled = settings.get("proxy_enabled", False)
                 proxy_host = settings.get("proxy_host", "127.0.0.1")
                 proxy_port = settings.get("proxy_port", 9050)
@@ -245,11 +252,12 @@ async def start_relay_client_worker():
                 r_host = host_port[0]
                 r_port = int(host_port[1]) if len(host_port) > 1 else 49156
 
-                logger.info(f"[RelayWorker] Connecting to Relay Server {r_host}:{r_port} as user {my_user_id}...")
+                logger.info(f"[RelayWorker] Connecting ANONYMOUSLY to Relay Server {r_host}:{r_port}...")
                 reader, writer = await connect_tcp_or_socks5(r_host, r_port, proxy_enabled, proxy_host, proxy_port)
 
+                # ANONYMOUS WebSocket Handshake (NO user_id in URL!)
                 handshake = (
-                    f"GET /relay/{urllib.parse.quote(my_user_id)} HTTP/1.1\r\n"
+                    f"GET /relay/stream HTTP/1.1\r\n"
                     f"Host: {r_host}:{r_port}\r\n"
                     f"Upgrade: websocket\r\n"
                     f"Connection: Upgrade\r\n"
@@ -262,8 +270,22 @@ async def start_relay_client_worker():
 
                 resp = await reader.readuntil(b"\r\n\r\n")
                 if b"101" in resp or b"Switching Protocols" in resp:
-                    logger.info(f"[RelayWorker] Connected & registered on Relay Server as {my_user_id}")
+                    logger.info(f"[RelayWorker] Connected anonymously to Relay stream. Registering Delivery Token {my_delivery_token[:8]}...")
                     relay_writer_stream = writer
+
+                    # Send anonymous Delivery Token registration
+                    reg_payload = json.dumps({"type": "register_token", "delivery_token": my_delivery_token}).encode("utf-8")
+                    reg_len = len(reg_payload)
+                    reg_hdr = bytearray([0x81])
+                    reg_mask = secrets.token_bytes(4)
+                    if reg_len < 126: reg_hdr.append(0x80 | reg_len)
+                    else: reg_hdr.extend([0x80 | 126] + list(reg_len.to_bytes(2, "big")))
+                    reg_hdr.extend(reg_mask)
+                    reg_masked = bytearray(reg_len)
+                    for i in range(reg_len): reg_masked[i] = reg_payload[i] ^ reg_mask[i % 4]
+                    
+                    writer.write(reg_hdr + reg_masked)
+                    await writer.drain()
 
                     while not reader.at_eof():
                         head = await reader.read(2)
@@ -291,7 +313,7 @@ async def start_relay_client_worker():
 
                         try:
                             msg_data = json.loads(payload_str)
-                            if msg_data.get("type") == "incoming_e2ee_packet" and "packet" in msg_data:
+                            if msg_data.get("type") == "incoming_sealed_packet" and "packet" in msg_data:
                                 p = msg_data["packet"]
                                 incoming = IncomingMsg(
                                     id=p["id"],
@@ -303,7 +325,7 @@ async def start_relay_client_worker():
                                 )
                                 api_receive_message(incoming)
                         except Exception as ex:
-                            logger.warning(f"[RelayWorker] Error processing incoming relay packet: {ex}")
+                            logger.warning(f"[RelayWorker] Error processing incoming sealed packet: {ex}")
                 else:
                     logger.warning(f"[RelayWorker] Relay Handshake rejected: {resp[:100]}")
 
@@ -413,7 +435,7 @@ def init_dbs():
         db.execute("""CREATE TABLE IF NOT EXISTS identity (
             id INTEGER PRIMARY KEY, user_id TEXT, display_name TEXT DEFAULT '',
             sign_pk TEXT, sign_sk TEXT, dh_pk TEXT, dh_sk TEXT,
-            spk_pk TEXT, spk_sk TEXT, spk_sig TEXT, created_at INTEGER)""")
+            spk_pk TEXT, spk_sk TEXT, spk_sig TEXT, delivery_token TEXT DEFAULT NULL, created_at INTEGER)""")
         db.execute("""CREATE TABLE IF NOT EXISTS sessions (
             contact_id TEXT PRIMARY KEY,
             shared_key TEXT,
@@ -426,7 +448,7 @@ def init_dbs():
         db.execute("""CREATE TABLE IF NOT EXISTS contacts (
             user_id TEXT PRIMARY KEY, display_name TEXT DEFAULT '',
             sign_pk TEXT, dh_pk TEXT, spk_pk TEXT DEFAULT NULL, spk_sig TEXT DEFAULT NULL,
-            trust_level TEXT DEFAULT 'unverified', host TEXT DEFAULT NULL, port INTEGER DEFAULT NULL,
+            delivery_token TEXT DEFAULT NULL, trust_level TEXT DEFAULT 'unverified', host TEXT DEFAULT NULL, port INTEGER DEFAULT NULL,
             added_at INTEGER)""")
         db.commit()
 
@@ -472,6 +494,8 @@ def migrate():
         if "spk_pk" not in cols:
             db.execute("ALTER TABLE contacts ADD COLUMN spk_pk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE contacts ADD COLUMN spk_sig TEXT DEFAULT NULL")
+        if "delivery_token" not in cols:
+            db.execute("ALTER TABLE contacts ADD COLUMN delivery_token TEXT DEFAULT NULL")
         db.commit()
 
     with get_db(KEYS_DB) as db:
@@ -480,6 +504,8 @@ def migrate():
             db.execute("ALTER TABLE identity ADD COLUMN spk_pk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE identity ADD COLUMN spk_sk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE identity ADD COLUMN spk_sig TEXT DEFAULT NULL")
+        if "delivery_token" not in cols:
+            db.execute("ALTER TABLE identity ADD COLUMN delivery_token TEXT DEFAULT NULL")
         db.commit()
 migrate()
 
@@ -514,6 +540,7 @@ def api_get_identity():
         "dh_pk": id_data["dh_pk"],
         "spk_pk": id_data.get("spk_pk"),
         "spk_sig": id_data.get("spk_sig"),
+        "delivery_token": id_data.get("delivery_token"),
     }
 
 @app.post("/identity")
@@ -527,12 +554,12 @@ def api_create_identity(req: CreateIdentityReq):
     dh_sk   = nacl.public.PrivateKey.generate()
     dh_pk   = dh_sk.public_key
 
-    # Generate Signed Prekey (SPK) for X3DH Protocol
     spk_sk = nacl.public.PrivateKey.generate()
     spk_pk = spk_sk.public_key
     spk_sig = sign_sk.sign(bytes(spk_pk)).signature
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
+    delivery_token = secrets.token_hex(16)
 
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
@@ -540,10 +567,10 @@ def api_create_identity(req: CreateIdentityReq):
 
     with get_db(KEYS_DB) as db:
         db.execute(
-            """INSERT INTO identity (id, user_id, display_name, sign_pk, sign_sk, dh_pk, dh_sk, spk_pk, spk_sk, spk_sig, created_at)
-               VALUES (1,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO identity (id, user_id, display_name, sign_pk, sign_sk, dh_pk, dh_sk, spk_pk, spk_sk, spk_sig, delivery_token, created_at)
+               VALUES (1,?,?,?,?,?,?,?,?,?,?,?)""",
             (user_id, req.display_name, b64e(bytes(sign_pk)), enc_sign_sk, b64e(bytes(dh_pk)), enc_dh_sk,
-             b64e(bytes(spk_pk)), enc_spk_sk, b64e(spk_sig), int(time.time()))
+             b64e(bytes(spk_pk)), enc_spk_sk, b64e(spk_sig), delivery_token, int(time.time()))
         )
         db.commit()
 
@@ -574,6 +601,7 @@ def api_export_identity():
         "dh_pk": id_data["dh_pk"],
         "spk_pk": id_data.get("spk_pk"),
         "spk_sig": id_data.get("spk_sig"),
+        "delivery_token": id_data.get("delivery_token"),
     }
 
 # ─── Contacts ────────────────────────────────────────────────────────────────
@@ -584,6 +612,7 @@ class AddContactReq(BaseModel):
     dh_pk: str
     spk_pk: Optional[str] = None
     spk_sig: Optional[str] = None
+    delivery_token: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = None
 
@@ -597,9 +626,9 @@ def api_get_contacts():
 def api_add_contact(req: AddContactReq):
     with get_db(CONTACTS_DB) as db:
         db.execute(
-            """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, host, port, added_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, req.host, req.port, int(time.time()))
+            """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, req.delivery_token, req.host, req.port, int(time.time()))
         )
         db.commit()
     return {"ok": True}
@@ -634,7 +663,6 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_hea
         their_sign_pk = nacl.signing.VerifyKey(b64d(contact["sign_pk"]))
         ek_a = None
 
-        # Check if Signed Prekey (SPK) is available for Real X3DH Protocol
         if is_sender and contact["spk_pk"] and contact["spk_sig"]:
             their_spk_pk = nacl.public.PublicKey(b64d(contact["spk_pk"]))
             their_spk_sig = b64d(contact["spk_sig"])
@@ -648,7 +676,6 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_hea
             )
             logger.info(f"[X3DH] Derived Sender Master Shared Secret with Ephemeral Key EK_A for {contact_id}")
         elif not is_sender and incoming_header and incoming_header.get("ek"):
-            # Receiver derives shared secret using Alice's Ephemeral Key EK_A passed in initial header
             alice_ek_pk = nacl.public.PublicKey(b64d(incoming_header["ek"]))
             my_spk_sk = nacl.public.PrivateKey(b64d(id_data["spk_sk"]))
             shared_secret = x3dh_receiver_derive(
@@ -659,7 +686,6 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_hea
             )
             logger.info(f"[X3DH] Derived Receiver Master Shared Secret using received Ephemeral Key EK_A from {contact_id}")
         else:
-            # Fallback 1-step DH
             shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
 
         if is_sender:
@@ -736,7 +762,6 @@ async def api_send_message(req: SendMsgReq):
     msg_id = secrets.token_hex(16)
     now = int(time.time())
 
-    # Double Ratchet Encryption
     st = get_or_create_ratchet_session(req.conversation_id, is_sender=True)
     header, ciphertext_b64 = ratchet_encrypt(st, req.content)
     save_ratchet_session(req.conversation_id, st)
@@ -984,7 +1009,6 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
         if not g: raise HTTPException(404, f"Group {group_id} not found")
         sender_key = b64d(vault_decrypt(g["sender_key"]))
 
-    # Sign group message payload with sender's Signing Key
     sign_sk = nacl.signing.SigningKey(b64d(identity["sign_sk"]))
     signature = sign_sk.sign(req.content.encode("utf-8")).signature
 
@@ -1008,10 +1032,6 @@ class ReceiveGroupMsgReq(BaseModel):
 
 @app.post("/groups/{group_id}/receive")
 def receive_group_message(group_id: str, req: ReceiveGroupMsgReq):
-    """
-    Decrypts group message payload and VERIFIES cryptographic Ed25519 signature of sender.
-    Prevents group impersonation and forgery.
-    """
     with get_db(GROUPS_DB) as db:
         g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
         if not g: raise HTTPException(404, f"Group {group_id} not found")
@@ -1026,7 +1046,6 @@ def receive_group_message(group_id: str, req: ReceiveGroupMsgReq):
         signature_b64 = payload_data["signature"]
         sender_id = payload_data["sender_id"]
 
-        # Cryptographic Signature Verification
         with get_db(GROUPS_DB) as db:
             member = db.execute("SELECT sign_pk FROM group_members WHERE group_id=? AND user_id=?", (group_id, sender_id)).fetchone()
         
