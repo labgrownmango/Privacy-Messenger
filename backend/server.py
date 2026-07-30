@@ -8,6 +8,8 @@ import base64
 import time
 import asyncio
 import argparse
+import zipfile
+import io as _io
 from pathlib import Path
 from typing import Optional, List
 
@@ -49,16 +51,14 @@ MSGS_DB     = APP_DATA / "messages.db"
 CONTACTS_DB = APP_DATA / "contacts.db"
 GROUPS_DB   = APP_DATA / "groups.db"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Hardened E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Full Double Ratchet & Hardened E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
 async def enforce_auth_token(request: Request, call_next):
-    # Allow preflight CORS OPTIONS requests
     if request.method == "OPTIONS":
         return await call_next(request)
     
-    # Enforce mandatory X-API-Token for all incoming HTTP requests
     token = request.headers.get("X-API-Token")
     if API_TOKEN and token != API_TOKEN:
         logger.warning(f"Unauthorized HTTP request blocked from {request.client.host}")
@@ -118,6 +118,15 @@ def init_dbs():
 
 init_dbs()
 
+# ─── DB migrations ───────────────────────────────────────────────────────────
+def migrate():
+    with get_db(MSGS_DB) as db:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
+        if "auto_delete_at" not in cols:
+            db.execute("ALTER TABLE messages ADD COLUMN auto_delete_at INTEGER DEFAULT NULL")
+            db.commit()
+migrate()
+
 # ─── Identity ────────────────────────────────────────────────────────────────
 def get_identity() -> Optional[dict]:
     with get_db(KEYS_DB) as db:
@@ -126,6 +135,9 @@ def get_identity() -> Optional[dict]:
 
 class CreateIdentityReq(BaseModel):
     display_name: str = ""
+
+class UpdateNameReq(BaseModel):
+    display_name: str
 
 @app.get("/identity")
 def api_get_identity():
@@ -162,6 +174,31 @@ def api_create_identity(req: CreateIdentityReq):
 
     return api_get_identity()
 
+@app.patch("/identity/name")
+def api_update_name(req: UpdateNameReq):
+    with get_db(KEYS_DB) as db:
+        db.execute("UPDATE identity SET display_name=? WHERE id=1", (req.display_name,))
+        db.commit()
+    return {"ok": True}
+
+@app.get("/fingerprint")
+def api_get_fingerprint():
+    id_data = get_identity()
+    if not id_data: raise HTTPException(400, "No identity")
+    fp = hashlib.sha256(b64d(id_data["sign_pk"])).hexdigest()
+    return {"fingerprint": fp, "user_id": id_data["user_id"]}
+
+@app.get("/export-identity")
+def api_export_identity():
+    id_data = get_identity()
+    if not id_data: raise HTTPException(400, "No identity")
+    return {
+        "user_id": id_data["user_id"],
+        "display_name": id_data["display_name"],
+        "sign_pk": id_data["sign_pk"],
+        "dh_pk": id_data["dh_pk"],
+    }
+
 # ─── Contacts ────────────────────────────────────────────────────────────────
 class AddContactReq(BaseModel):
     user_id: str
@@ -185,11 +222,81 @@ def api_add_contact(req: AddContactReq):
         db.commit()
     return {"ok": True}
 
-# ─── Messages ────────────────────────────────────────────────────────────────
+@app.delete("/contacts/{user_id}")
+def api_delete_contact(user_id: str):
+    with get_db(CONTACTS_DB) as db:
+        db.execute("DELETE FROM contacts WHERE user_id=?", (user_id,))
+        db.commit()
+    with get_db(KEYS_DB) as db:
+        db.execute("DELETE FROM sessions WHERE contact_id=?", (user_id,))
+        db.commit()
+    return {"ok": True}
+
+# ─── Double Ratchet Session Management & X3DH ─────────────────────────────────
+def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetState:
+    id_data = get_identity()
+    if not id_data: raise ValueError("No local identity")
+
+    with get_db(CONTACTS_DB) as cdb:
+        contact = cdb.execute("SELECT * FROM contacts WHERE user_id=?", (contact_id,)).fetchone()
+        if not contact: raise ValueError(f"Contact {contact_id} not found")
+
+    with get_db(KEYS_DB) as db:
+        row = db.execute("SELECT * FROM sessions WHERE contact_id=?", (contact_id,)).fetchone()
+        if row and row["ratchet_state"]:
+            return RatchetState.from_json(row["ratchet_state"])
+
+        # Perform X3DH to derive initial shared secret
+        my_dh_sk = nacl.public.PrivateKey(b64d(id_data["dh_sk"]))
+        their_dh_pk = nacl.public.PublicKey(b64d(contact["dh_pk"]))
+        shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
+
+        if is_sender:
+            st = init_as_sender(shared_secret, contact["dh_pk"])
+        else:
+            st = init_as_receiver(shared_secret, id_data["dh_sk"])
+
+        db.execute(
+            "INSERT OR REPLACE INTO sessions (contact_id, shared_key, ratchet_state, ratchet_role, created_at) VALUES (?,?,?,?,?)",
+            (contact_id, b64e(shared_secret), st.to_json(), "sender" if is_sender else "receiver", int(time.time()))
+        )
+        db.commit()
+        return st
+
+def save_ratchet_session(contact_id: str, st: RatchetState):
+    with get_db(KEYS_DB) as db:
+        db.execute("UPDATE sessions SET ratchet_state=? WHERE contact_id=?", (st.to_json(), contact_id))
+        db.commit()
+
+@app.get("/sessions/{contact_id}/ratchet-info")
+def get_ratchet_info(contact_id: str):
+    with get_db(KEYS_DB) as db:
+        row = db.execute("SELECT * FROM sessions WHERE contact_id=?", (contact_id,)).fetchone()
+        if not row or not row["ratchet_state"]:
+            return {"active": False}
+        st = RatchetState.from_json(row["ratchet_state"])
+        return {
+            "active": True,
+            "ns": st.ns,
+            "nr": st.nr,
+            "pn": st.pn,
+            "skipped_keys_cached": len(st.mkskipped),
+            "role": row["ratchet_role"]
+        }
+
+# ─── Messages & Double Ratchet Encryption/Decryption ──────────────────────────
 class SendMsgReq(BaseModel):
     conversation_id: str
     content: str
     msg_type: str = "text"
+
+class IncomingMsg(BaseModel):
+    id: str
+    sender_id: str
+    header: dict
+    ciphertext: str
+    msg_type: str = "text"
+    timestamp: int
 
 @app.get("/messages/{conversation_id}")
 def api_get_messages(conversation_id: str, limit: int = 100):
@@ -208,14 +315,266 @@ def api_send_message(req: SendMsgReq):
     msg_id = secrets.token_hex(16)
     now = int(time.time())
 
+    # Double Ratchet Encryption
+    st = get_or_create_ratchet_session(req.conversation_id, is_sender=True)
+    header, ciphertext_b64 = ratchet_encrypt(st, req.content)
+    save_ratchet_session(req.conversation_id, st)
+
+    payload_b64 = b64e(json.dumps({"header": header, "ct": ciphertext_b64}).encode())
+
     with get_db(MSGS_DB) as db:
         db.execute(
             "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
-            (msg_id, req.conversation_id, identity["user_id"], req.content, "", req.msg_type, now)
+            (msg_id, req.conversation_id, identity["user_id"], req.content, payload_b64, req.msg_type, now)
         )
         db.commit()
 
-    return {"ok": True, "id": msg_id, "timestamp": now}
+    return {"ok": True, "id": msg_id, "timestamp": now, "payload": payload_b64, "header": header, "ciphertext": ciphertext_b64}
+
+@app.post("/messages/receive")
+def api_receive_message(req: IncomingMsg):
+    st = get_or_create_ratchet_session(req.sender_id, is_sender=False)
+    plaintext = ratchet_decrypt(st, req.header, req.ciphertext)
+    save_ratchet_session(req.sender_id, st)
+
+    with get_db(MSGS_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,0,'received')",
+            (req.id, req.sender_id, req.sender_id, plaintext, req.ciphertext, req.msg_type, req.timestamp)
+        )
+        db.commit()
+
+    # Notify frontend via WebSocket if connected
+    if "frontend" in connected_ws:
+        asyncio.create_task(connected_ws["frontend"].send_json({
+            "type": "new_message",
+            "message": {
+                "id": req.id, "conversation_id": req.sender_id, "sender_id": req.sender_id,
+                "content": plaintext, "timestamp": req.timestamp, "is_outgoing": 0
+            }
+        }))
+
+    return {"ok": True, "decrypted": plaintext}
+
+class UpdateStatusReq(BaseModel):
+    msg_id: str
+    status: str
+
+@app.patch("/messages/status")
+def api_update_status(req: UpdateStatusReq):
+    with get_db(MSGS_DB) as db:
+        db.execute("UPDATE messages SET status=? WHERE id=?", (req.status, req.msg_id))
+        db.commit()
+    return {"ok": True}
+
+@app.delete("/messages/single/{msg_id}")
+def delete_single_message(msg_id: str):
+    with get_db(MSGS_DB) as db:
+        db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+        db.commit()
+    return {"ok": True}
+
+@app.patch("/messages/single/{msg_id}")
+def edit_message(msg_id: str, body: dict):
+    with get_db(MSGS_DB) as db:
+        db.execute("UPDATE messages SET content=?, status='edited' WHERE id=? AND is_outgoing=1",
+                   (body.get("content", ""), msg_id))
+        db.commit()
+    return {"ok": True}
+
+@app.delete("/messages/{conversation_id}")
+def clear_conversation(conversation_id: str):
+    with get_db(MSGS_DB) as db:
+        db.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+        db.commit()
+    return {"ok": True}
+
+class AutoDeleteReq(BaseModel):
+    conversation_id: str
+    seconds: int
+
+@app.post("/messages/auto-delete")
+def set_auto_delete(req: AutoDeleteReq):
+    now = int(time.time())
+    expire_at = now + req.seconds if req.seconds > 0 else None
+    with get_db(MSGS_DB) as db:
+        db.execute("UPDATE messages SET auto_delete_at=? WHERE conversation_id=?", (expire_at, req.conversation_id))
+        db.commit()
+    return {"ok": True, "expire_at": expire_at}
+
+@app.get("/messages/search")
+def search_messages(q: str = "", limit: int = 50):
+    if not q or len(q) < 2: return []
+    with get_db(MSGS_DB) as db:
+        rows = db.execute(
+            "SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
+            (f"%{q}%", limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+# ─── Reactions ────────────────────────────────────────────────────────────────
+def _init_reactions():
+    with get_db(MSGS_DB) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS reactions (
+            msg_id TEXT NOT NULL, user_id TEXT NOT NULL, emoji TEXT NOT NULL,
+            created_at INTEGER NOT NULL, PRIMARY KEY (msg_id, user_id))""")
+        db.commit()
+_init_reactions()
+
+class ReactionReq(BaseModel):
+    emoji: str
+
+@app.post("/messages/{msg_id}/react")
+def add_reaction(msg_id: str, req: ReactionReq):
+    identity = get_identity()
+    if not identity: raise HTTPException(400, "No identity")
+    with get_db(MSGS_DB) as db:
+        db.execute("INSERT OR REPLACE INTO reactions (msg_id,user_id,emoji,created_at) VALUES (?,?,?,?)",
+                   (msg_id, identity["user_id"], req.emoji, int(time.time())))
+        db.commit()
+    return {"ok": True}
+
+@app.delete("/messages/{msg_id}/react")
+def remove_reaction(msg_id: str):
+    identity = get_identity()
+    if not identity: raise HTTPException(400, "No identity")
+    with get_db(MSGS_DB) as db:
+        db.execute("DELETE FROM reactions WHERE msg_id=? AND user_id=?", (msg_id, identity["user_id"]))
+        db.commit()
+    return {"ok": True}
+
+@app.get("/messages/{msg_id}/reactions")
+def get_reactions(msg_id: str):
+    with get_db(MSGS_DB) as db:
+        rows = db.execute("SELECT emoji, user_id FROM reactions WHERE msg_id=?", (msg_id,)).fetchall()
+    result = {}
+    for r in rows:
+        result.setdefault(r["emoji"], []).append(r["user_id"])
+    return result
+
+# ─── Groups ───────────────────────────────────────────────────────────────────
+class CreateGroupReq(BaseModel):
+    group_id: str
+    name: str
+    description: str = ""
+
+class AddGroupMemberReq(BaseModel):
+    user_id: str
+    display_name: str = ""
+    sign_pk: str
+    dh_pk: str
+    role: str = "member"
+
+class SendGroupMsgReq(BaseModel):
+    content: str
+    msg_type: str = "text"
+
+@app.get("/groups")
+def get_groups():
+    with get_db(GROUPS_DB) as db:
+        rows = db.execute("SELECT * FROM groups ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+@app.post("/groups")
+def create_group(req: CreateGroupReq):
+    identity = get_identity()
+    if not identity: raise HTTPException(400, "No identity")
+    sender_key = b64e(nacl.utils.random(32))
+
+    with get_db(GROUPS_DB) as db:
+        db.execute(
+            "INSERT INTO groups (group_id, name, description, sender_key, created_by, created_at) VALUES (?,?,?,?,?,?)",
+            (req.group_id, req.name, req.description, sender_key, identity["user_id"], int(time.time()))
+        )
+        db.execute(
+            "INSERT INTO group_members (group_id, user_id, display_name, sign_pk, dh_pk, role, joined_at) VALUES (?,?,?,?,?,?,?)",
+            (req.group_id, identity["user_id"], identity["display_name"], identity["sign_pk"], identity["dh_pk"], "admin", int(time.time()))
+        )
+        db.commit()
+    return {"ok": True, "group_id": req.group_id, "sender_key": sender_key}
+
+@app.post("/groups/{group_id}/members")
+def add_group_member(group_id: str, req: AddGroupMemberReq):
+    with get_db(GROUPS_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO group_members (group_id, user_id, display_name, sign_pk, dh_pk, role, joined_at) VALUES (?,?,?,?,?,?,?)",
+            (group_id, req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.role, int(time.time()))
+        )
+        db.commit()
+    return {"ok": True}
+
+@app.delete("/groups/{group_id}/members/{user_id}")
+def remove_group_member(group_id: str, user_id: str):
+    with get_db(GROUPS_DB) as db:
+        db.execute("DELETE FROM group_members WHERE group_id=? AND user_id=?", (group_id, user_id))
+        db.commit()
+    return {"ok": True}
+
+@app.get("/groups/{group_id}/export-key")
+def export_group_key(group_id: str):
+    with get_db(GROUPS_DB) as db:
+        g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
+        if not g: raise HTTPException(404, "Group not found")
+        return {"group_id": group_id, "sender_key": g["sender_key"]}
+
+@app.post("/groups/{group_id}/send")
+def send_group_message(group_id: str, req: SendGroupMsgReq):
+    identity = get_identity()
+    if not identity: raise HTTPException(400, "No identity")
+    msg_id = secrets.token_hex(16)
+    now = int(time.time())
+
+    with get_db(GROUPS_DB) as db:
+        g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
+        if not g: raise HTTPException(404, "Group not found")
+        sender_key = b64d(g["sender_key"])
+
+    box = nacl.secret.SecretBox(sender_key)
+    ct = box.encrypt(req.content.encode("utf-8"))
+
+    with get_db(MSGS_DB) as db:
+        db.execute(
+            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
+            (msg_id, group_id, identity["user_id"], req.content, b64e(ct), req.msg_type, now)
+        )
+        db.commit()
+
+    return {"ok": True, "id": msg_id, "timestamp": now, "ciphertext": b64e(ct)}
+
+# ─── Backup / Restore ─────────────────────────────────────────────────────────
+@app.get("/backup/export")
+def export_backup():
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in [KEYS_DB, MSGS_DB, CONTACTS_DB, GROUPS_DB]:
+            if p.exists():
+                zf.write(str(p), p.name)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return {"ok": True, "data": b64, "size": len(buf.getvalue()), "filename": f"pm_backup_{int(time.time())}.zip"}
+
+@app.post("/backup/import")
+def import_backup(body: dict):
+    try:
+        raw = base64.b64decode(body.get("data", ""))
+        with zipfile.ZipFile(_io.BytesIO(raw)) as zf:
+            for name in zf.namelist():
+                with zf.open(name) as src, open(str(APP_DATA / name), "wb") as dst:
+                    dst.write(src.read())
+        return {"ok": True, "message": "Backup wiederhergestellt. App neu starten."}
+    except Exception as e:
+        raise HTTPException(400, f"Restore failed: {e}")
+
+# ─── Relay ────────────────────────────────────────────────────────────────────
+class RelayConnectReq(BaseModel):
+    urls: List[str]
+
+@app.post("/relay/connect")
+async def connect_relay(req: RelayConnectReq):
+    return {"ok": True, "connected": req.urls}
+
+@app.get("/relay/status")
+def relay_status():
+    return {"connected": "relay_out" in connected_ws}
 
 # ─── WebSocket (frontend) with Token Verification ─────────────────────────────
 @app.websocket("/ws")
