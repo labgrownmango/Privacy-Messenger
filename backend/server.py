@@ -117,11 +117,10 @@ def lock_vault_session():
     logger.info("[Vault] Locked vault session.")
 
 def vault_encrypt(plaintext: str) -> str:
-    """Encrypt sensitive string at rest using ChaCha20-Poly1305 SecretBox with VAULT_MASTER_KEY."""
+    """Encrypt sensitive string at rest. Strictly throws HTTP 423 if vault is locked (no unencrypted fallbacks)."""
     if not plaintext: return ""
     if not VAULT_MASTER_KEY:
-        # Fallback to unencrypted if vault not configured yet
-        return plaintext
+        raise HTTPException(status_code=423, detail="Vault is locked. Master passphrase unlock required.")
     box = nacl.secret.SecretBox(VAULT_MASTER_KEY)
     ct = box.encrypt(plaintext.encode("utf-8"))
     return "ENC:" + b64e(ct)
@@ -697,10 +696,11 @@ async def connect_relay(req: RelayConnectReq):
 def relay_status():
     return {"connected": "relay_out" in connected_ws}
 
-# ─── WebSocket (frontend) with Token Verification ─────────────────────────────
+# ─── WebSocket (frontend) with Token Verification via Protocol Header ────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    token = ws.query_params.get("token")
+    # Check Sec-WebSocket-Protocol or query parameter for token
+    token = ws.query_params.get("token") or ws.headers.get("sec-websocket-protocol")
     if API_TOKEN and token != API_TOKEN:
         logger.warning(f"WebSocket connection rejected: invalid API token")
         await ws.close(code=4003)
