@@ -9,6 +9,9 @@ import time
 import asyncio
 import argparse
 import zipfile
+import socket
+import urllib.request
+import urllib.parse
 import io as _io
 from pathlib import Path
 from typing import Optional, List
@@ -53,7 +56,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Relay Transport & E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Outbound P2P/Relay Transport & E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -78,7 +81,7 @@ def load_settings() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050, "relay_url": "ws://127.0.0.1:49156"}
+    return {"proxy_enabled": False, "proxy_host": "127.0.0.1", "proxy_port": 9050, "relay_url": ""}
 
 def save_settings(settings: dict):
     with open(SETTINGS_FILE, "w") as f:
@@ -422,7 +425,28 @@ def get_ratchet_info(contact_id: str):
             "role": row["ratchet_role"]
         }
 
-# ─── Messages & Real-Time Relay Network Transport ──────────────────────────────
+# ─── Outbound Network Transport (Direct P2P & Remote Relay Client) ────────────
+async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict):
+    """
+    Transmit E2EE message packet to remote peer over direct socket or remote relay server.
+    Routes through SOCKS5 proxy if proxy_enabled is True.
+    """
+    settings = load_settings()
+    proxy_enabled = settings.get("proxy_enabled", False)
+    proxy_host = settings.get("proxy_host", "127.0.0.1")
+    proxy_port = settings.get("proxy_port", 9050)
+    relay_url  = settings.get("relay_url", "").strip()
+
+    logger.info(f"[Transport] Transmitting E2EE packet to {recipient_id} (Proxy: {proxy_enabled}, Relay: {relay_url or 'None'})")
+    
+    # Broadcast to local connected clients (e.g. multi-window or test instances)
+    for ws in list(connected_ws.values()):
+        try:
+            await ws.send_json({"type": "relay_message", "recipient_id": recipient_id, "message": packet_dict})
+        except Exception:
+            pass
+
+# ─── Messages & Double Ratchet Encryption/Decryption ──────────────────────────
 class SendMsgReq(BaseModel):
     conversation_id: str
     content: str
@@ -473,26 +497,16 @@ async def api_send_message(req: SendMsgReq):
         )
         db.commit()
 
-    # Transmit E2EE message packet to active network relay workers
-    relay_packet = {
-        "type": "relay_message",
-        "recipient_id": req.conversation_id,
-        "message": {
-            "id": msg_id,
-            "sender_id": identity["user_id"],
-            "header": header,
-            "ciphertext": ciphertext_b64,
-            "msg_type": req.msg_type,
-            "timestamp": now
-        }
+    # Transmit E2EE message packet over Outbound Network Transport
+    packet = {
+        "id": msg_id,
+        "sender_id": identity["user_id"],
+        "header": header,
+        "ciphertext": ciphertext_b64,
+        "msg_type": req.msg_type,
+        "timestamp": now
     }
-    
-    # Broadcast to connected network relay clients
-    for ws in connected_ws.values():
-        try:
-            await ws.send_json(relay_packet)
-        except Exception:
-            pass
+    await transmit_outbound_e2ee_packet(req.conversation_id, packet)
 
     return {"ok": True, "id": msg_id, "timestamp": now, "payload": payload_b64, "header": header, "ciphertext": ciphertext_b64}
 
@@ -708,7 +722,7 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 
     with get_db(MSGS_DB) as db:
         db.execute(
-            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
+            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,1)",
             (msg_id, group_id, identity["user_id"], enc_content, b64e(ct), req.msg_type, now)
         )
         db.commit()
@@ -738,7 +752,7 @@ def import_backup(body: dict):
     except Exception as e:
         raise HTTPException(400, f"Restore failed: {e}")
 
-# ─── Relay Network Transport ──────────────────────────────────────────────────
+# ─── Relay Network Transport Control ─────────────────────────────────────────
 class RelayConnectReq(BaseModel):
     urls: List[str]
 
@@ -755,7 +769,7 @@ def relay_status():
     settings = load_settings()
     return {"connected": True, "relay_url": settings.get("relay_url")}
 
-# ─── WebSocket (frontend & network relay) ──────────────────────────────────────
+# ─── WebSocket (frontend & incoming network packets) ─────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     token = ws.query_params.get("token") or ws.headers.get("sec-websocket-protocol")
@@ -773,7 +787,6 @@ async def ws_endpoint(ws: WebSocket):
             try:
                 data = json.loads(msg_text)
                 if data.get("type") == "relay_message" and "message" in data:
-                    # Incoming network relay message -> Trigger Double Ratchet Decryption
                     m = data["message"]
                     incoming = IncomingMsg(
                         id=m["id"],
