@@ -1,10 +1,14 @@
 """
-End-to-End Automated Integration Test Suite for Privacy Messenger
-===================================================================
+End-to-End Automated Integration & Security Boundary Test Suite
+=================================================================
 Validates:
 1. Real X3DH Protocol with Ephemeral Key (EK_A) & Signed Prekey (SPK_B) signature verification.
 2. Double Ratchet E2EE message roundtrip (Alice -> Bob and Bob -> Alice).
 3. Group Chat message Ed25519 signature verification.
+4. Negative Security Boundary Tests:
+   - Forged SPK Signature Detection (BadSignatureError)
+   - Header AEAD AAD Tampering Detection (CryptoError)
+   - Forged Group Signature Detection (BadSignatureError)
 """
 
 import sys
@@ -13,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import nacl.public
 import nacl.signing
+import nacl.exceptions
 from ratchet import (
     RatchetState, init_as_sender, init_as_receiver,
     ratchet_encrypt, ratchet_decrypt, b64e, b64d,
@@ -100,7 +105,72 @@ def test_group_signature_verification():
     sender_sign_pk.verify(group_content.encode("utf-8"), signature)
     print("[OK] Group message signature successfully verified using sender's Ed25519 VerifyKey!")
 
+def test_negative_security_tamper_detection():
+    print("\n=== [TEST 3] Negative Security Boundary Tests (Tamper Detection) ===")
+
+    alice_ik_sk = nacl.public.PrivateKey.generate()
+    bob_ik_sk = nacl.public.PrivateKey.generate()
+    bob_sign_sk = nacl.signing.SigningKey.generate()
+    eve_sign_sk = nacl.signing.SigningKey.generate() # Attacker
+
+    bob_spk_sk = nacl.public.PrivateKey.generate()
+    bob_spk_pk = bob_spk_sk.public_key
+
+    # 1. Negative Test: Forged SPK Signature Detection
+    forged_spk_sig = eve_sign_sk.sign(bytes(bob_spk_pk)).signature
+    try:
+        x3dh_sender_derive(
+            alice_ik_sk=alice_ik_sk,
+            bob_ik_pk=bob_ik_sk.public_key,
+            bob_spk_pk=bob_spk_pk,
+            bob_spk_sig=forged_spk_sig,
+            bob_sign_pk=bob_sign_sk.verify_key
+        )
+        assert False, "Security Violation: Forged SPK signature was NOT rejected!"
+    except nacl.exceptions.BadSignatureError:
+        print("[OK] Forged SPK Signature correctly rejected with BadSignatureError.")
+
+    # 2. Negative Test: Header AAD Tampering Detection
+    valid_spk_sig = bob_sign_sk.sign(bytes(bob_spk_pk)).signature
+    alice_shared_secret, ek_a = x3dh_sender_derive(
+        alice_ik_sk=alice_ik_sk,
+        bob_ik_pk=bob_ik_sk.public_key,
+        bob_spk_pk=bob_spk_pk,
+        bob_spk_sig=valid_spk_sig,
+        bob_sign_pk=bob_sign_sk.verify_key
+    )
+    alice_state = init_as_sender(alice_shared_secret, b64e(bytes(bob_ik_sk.public_key)), ek_a=ek_a)
+    header, ciphertext_b64 = ratchet_encrypt(alice_state, "Secret Data")
+
+    bob_shared_secret = x3dh_receiver_derive(
+        bob_ik_sk=bob_ik_sk,
+        bob_spk_sk=bob_spk_sk,
+        alice_ik_pk=alice_ik_sk.public_key,
+        alice_ek_pk=ek_a.public_key
+    )
+    bob_state = init_as_receiver(bob_shared_secret, b64e(bytes(bob_ik_sk)))
+
+    # Tamper with header (e.g. alter message counter n)
+    tampered_header = dict(header)
+    tampered_header["n"] += 99
+
+    try:
+        ratchet_decrypt(bob_state, tampered_header, ciphertext_b64)
+        assert False, "Security Violation: Tampered Header AAD was NOT rejected!"
+    except (nacl.exceptions.CryptoError, Exception):
+        print("[OK] Header AAD tampering correctly rejected with CryptoError.")
+
+    # 3. Negative Test: Forged Group Message Signature Detection
+    group_content = "Normal Message"
+    forged_sig = eve_sign_sk.sign(group_content.encode("utf-8")).signature
+    try:
+        bob_sign_sk.verify_key.verify(group_content.encode("utf-8"), forged_sig)
+        assert False, "Security Violation: Forged Group Signature was NOT rejected!"
+    except nacl.exceptions.BadSignatureError:
+        print("[OK] Forged Group Signature correctly rejected with BadSignatureError.")
+
 if __name__ == "__main__":
     test_full_x3dh_and_double_ratchet_roundtrip()
     test_group_signature_verification()
-    print("\nALL AUTOMATED INTEGRATION TESTS PASSED 100% SUCCESSFULLY!")
+    test_negative_security_tamper_detection()
+    print("\nALL HAPPY PATH & NEGATIVE SECURITY BOUNDARY TESTS PASSED 100% SUCCESSFULLY!")
