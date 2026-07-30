@@ -41,8 +41,8 @@ npm run build
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter einer **Source-Available Non-Redistribution Lizenz**:
-- ✅ **Erlaubt:** Ansehen, Kompilieren und Modifizieren für den persönlichen / privaten Gebrauch.
-- ❌ **Verboten:** Weitergabe, Weitervertrieb, Veröffentlichung oder Verkauf ohne vorherige schriftliche Genehmigung der Urheber.
+Dieses Projekt steht unter einer **Nicht-Kommerziellen & Eingeschränkten Weitergabe-Lizenz**:
+- ✅ **Erlaubt:** Ansehen, Kompilieren, Modifizieren und Weitergeben im privaten/nicht-kommerziellen Rahmen (z. B. an Freunde).
+- ❌ **Verboten:** Kommerzielle Nutzung (Verkauf/Monetarisierung) sowie groß angelegte Massen-Weiterverteilung oder Hosting auf kommerziellen Portalen ohne schriftliche Genehmigung der Urheber.
 
 Siehe die [LICENSE](LICENSE) Datei für Details.
