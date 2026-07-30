@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.8 — Synchronized Relay Token Rotation & Vault Fix")
+app = FastAPI(title="Privacy Messenger v1.0.9 — Zero-Leakage Sealed Sender Delivery Tokens")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -166,6 +166,17 @@ async def register_delivery_token_on_relay(token: str):
         except Exception as e:
             logger.warning(f"[RelayWorker] Failed to register rotated token: {e}")
 
+def derive_initial_delivery_token(dh_pk_b64: str) -> str:
+    """
+    Deterministically derives initial 32-byte Delivery Token from contact's DH public key.
+    Ensures zero user_id leakage while guaranteeing delivery prior to first in-band token rotation.
+    """
+    try:
+        raw_pk = b64d(dh_pk_b64)
+        return b64e(hashlib.sha256(raw_pk).digest())
+    except Exception:
+        return b64e(secrets.token_bytes(32))
+
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     global relay_writer_stream
     settings = load_settings()
@@ -203,8 +214,13 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # Deliverable Token Fallback to recipient_id if no token exists yet
-    recipient_delivery_token = contact["delivery_token"] if (contact and contact["delivery_token"]) else recipient_id
+    # Strict Zero-Leakage Sealed Delivery Token (NO user_id fallback)
+    if contact and contact["delivery_token"]:
+        recipient_delivery_token = contact["delivery_token"]
+    elif contact and contact["dh_pk"]:
+        recipient_delivery_token = derive_initial_delivery_token(contact["dh_pk"])
+    else:
+        recipient_delivery_token = b64e(secrets.token_bytes(32))
 
     if relay_writer_stream and not relay_writer_stream.is_closing():
         try:
@@ -256,7 +272,7 @@ async def start_relay_client_worker():
             if identity and relay_url:
                 my_delivery_token = identity.get("delivery_token")
                 if not my_delivery_token:
-                    my_delivery_token = b64e(secrets.token_bytes(32))
+                    my_delivery_token = derive_initial_delivery_token(identity["dh_pk"])
                     with get_db(KEYS_DB) as db:
                         db.execute("UPDATE identity SET delivery_token=? WHERE id=1", (my_delivery_token,))
                         db.commit()
@@ -292,7 +308,7 @@ async def start_relay_client_worker():
                     logger.info(f"[RelayWorker] Connected anonymously. Registering Delivery Token {my_delivery_token[:12]}...")
                     relay_writer_stream = writer
 
-                    # Register current 32-byte delivery token
+                    # Register current initial/rotated delivery token
                     await register_delivery_token_on_relay(my_delivery_token)
 
                     while not reader.at_eof():
@@ -567,7 +583,7 @@ def api_create_identity(req: CreateIdentityReq):
     spk_sig = sign_sk.sign(bytes(spk_pk)).signature
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
-    delivery_token = b64e(secrets.token_bytes(32))
+    delivery_token = derive_initial_delivery_token(b64e(bytes(dh_pk)))
 
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
@@ -632,7 +648,7 @@ def api_get_contacts():
 
 @app.post("/contacts")
 def api_add_contact(req: AddContactReq):
-    token = req.delivery_token or req.user_id
+    token = req.delivery_token or derive_initial_delivery_token(req.dh_pk)
     with get_db(CONTACTS_DB) as db:
         db.execute(
             """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
