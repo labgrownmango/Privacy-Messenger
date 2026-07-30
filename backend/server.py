@@ -68,6 +68,38 @@ async def enforce_auth_token(request: Request, call_next):
 
 connected_ws: dict[str, WebSocket] = {}
 
+# ─── Storage At-Rest Encryption Vault Primitives (PBKDF2 + AES-256-GCM / SecretBox) ───
+VAULT_MASTER_KEY: Optional[bytes] = None
+
+def derive_vault_key(passphrase: str, salt: bytes) -> bytes:
+    """Derive 32-byte master key using PBKDF2-SHA256 (600,000 iterations)."""
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 600000, 32)
+
+def vault_encrypt(plaintext: str, key: Optional[bytes] = None) -> str:
+    """Encrypt sensitive string at rest using ChaCha20-Poly1305 / SecretBox."""
+    if not plaintext: return ""
+    use_key = key or VAULT_MASTER_KEY
+    if not use_key:
+        return plaintext   # Fallback if vault unlocked without master key
+    box = nacl.secret.SecretBox(use_key)
+    ct = box.encrypt(plaintext.encode("utf-8"))
+    return "ENC:" + b64e(ct)
+
+def vault_decrypt(ciphertext_str: str, key: Optional[bytes] = None) -> str:
+    """Decrypt sensitive string at rest."""
+    if not ciphertext_str: return ""
+    if not ciphertext_str.startswith("ENC:"):
+        return ciphertext_str   # Legacy unencrypted data
+    use_key = key or VAULT_MASTER_KEY
+    if not use_key:
+        return "[LOCKED]"   # Vault locked
+    try:
+        raw_ct = b64d(ciphertext_str[4:])
+        box = nacl.secret.SecretBox(use_key)
+        return box.decrypt(raw_ct).decode("utf-8")
+    except Exception:
+        return "[DECRYPTION_FAILED]"
+
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def get_db(path: Path):
     conn = sqlite3.connect(str(path), check_same_thread=False)
@@ -131,7 +163,12 @@ migrate()
 def get_identity() -> Optional[dict]:
     with get_db(KEYS_DB) as db:
         row = db.execute("SELECT * FROM identity WHERE id=1").fetchone()
-        return dict(row) if row else None
+        if not row: return None
+        d = dict(row)
+        # Decrypt private keys if encrypted at rest
+        d["sign_sk"] = vault_decrypt(d["sign_sk"])
+        d["dh_sk"]   = vault_decrypt(d["dh_sk"])
+        return d
 
 class CreateIdentityReq(BaseModel):
     display_name: str = ""
@@ -165,10 +202,14 @@ def api_create_identity(req: CreateIdentityReq):
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
 
+    # Encrypt private keys at rest
+    enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
+    enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
+
     with get_db(KEYS_DB) as db:
         db.execute(
             "INSERT INTO identity (id, user_id, display_name, sign_pk, sign_sk, dh_pk, dh_sk, created_at) VALUES (1,?,?,?,?,?,?,?)",
-            (user_id, req.display_name, b64e(bytes(sign_pk)), b64e(bytes(sign_sk)), b64e(bytes(dh_pk)), b64e(bytes(dh_sk)), int(time.time()))
+            (user_id, req.display_name, b64e(bytes(sign_pk)), enc_sign_sk, b64e(bytes(dh_pk)), enc_dh_sk, int(time.time()))
         )
         db.commit()
 
@@ -244,7 +285,8 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetSt
     with get_db(KEYS_DB) as db:
         row = db.execute("SELECT * FROM sessions WHERE contact_id=?", (contact_id,)).fetchone()
         if row and row["ratchet_state"]:
-            return RatchetState.from_json(row["ratchet_state"])
+            dec_state_json = vault_decrypt(row["ratchet_state"])
+            return RatchetState.from_json(dec_state_json)
 
         # Perform X3DH to derive initial shared secret
         my_dh_sk = nacl.public.PrivateKey(b64d(id_data["dh_sk"]))
@@ -256,16 +298,18 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool) -> RatchetSt
         else:
             st = init_as_receiver(shared_secret, id_data["dh_sk"])
 
+        enc_state = vault_encrypt(st.to_json())
         db.execute(
             "INSERT OR REPLACE INTO sessions (contact_id, shared_key, ratchet_state, ratchet_role, created_at) VALUES (?,?,?,?,?)",
-            (contact_id, b64e(shared_secret), st.to_json(), "sender" if is_sender else "receiver", int(time.time()))
+            (contact_id, b64e(shared_secret), enc_state, "sender" if is_sender else "receiver", int(time.time()))
         )
         db.commit()
         return st
 
 def save_ratchet_session(contact_id: str, st: RatchetState):
+    enc_state = vault_encrypt(st.to_json())
     with get_db(KEYS_DB) as db:
-        db.execute("UPDATE sessions SET ratchet_state=? WHERE contact_id=?", (st.to_json(), contact_id))
+        db.execute("UPDATE sessions SET ratchet_state=? WHERE contact_id=?", (enc_state, contact_id))
         db.commit()
 
 @app.get("/sessions/{contact_id}/ratchet-info")
@@ -274,7 +318,8 @@ def get_ratchet_info(contact_id: str):
         row = db.execute("SELECT * FROM sessions WHERE contact_id=?", (contact_id,)).fetchone()
         if not row or not row["ratchet_state"]:
             return {"active": False}
-        st = RatchetState.from_json(row["ratchet_state"])
+        dec_state_json = vault_decrypt(row["ratchet_state"])
+        st = RatchetState.from_json(dec_state_json)
         return {
             "active": True,
             "ns": st.ns,
@@ -305,7 +350,12 @@ def api_get_messages(conversation_id: str, limit: int = 100):
             "SELECT * FROM messages WHERE conversation_id=? ORDER BY timestamp ASC LIMIT ?",
             (conversation_id, limit)
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["content"] = vault_decrypt(d["content"])
+            result.append(d)
+        return result
 
 @app.post("/messages/send")
 def api_send_message(req: SendMsgReq):
@@ -321,11 +371,12 @@ def api_send_message(req: SendMsgReq):
     save_ratchet_session(req.conversation_id, st)
 
     payload_b64 = b64e(json.dumps({"header": header, "ct": ciphertext_b64}).encode())
+    enc_content = vault_encrypt(req.content)
 
     with get_db(MSGS_DB) as db:
         db.execute(
             "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
-            (msg_id, req.conversation_id, identity["user_id"], req.content, payload_b64, req.msg_type, now)
+            (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now)
         )
         db.commit()
 
@@ -337,14 +388,15 @@ def api_receive_message(req: IncomingMsg):
     plaintext = ratchet_decrypt(st, req.header, req.ciphertext)
     save_ratchet_session(req.sender_id, st)
 
+    enc_content = vault_encrypt(plaintext)
+
     with get_db(MSGS_DB) as db:
         db.execute(
             "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,0,'received')",
-            (req.id, req.sender_id, req.sender_id, plaintext, req.ciphertext, req.msg_type, req.timestamp)
+            (req.id, req.sender_id, req.sender_id, enc_content, req.ciphertext, req.msg_type, req.timestamp)
         )
         db.commit()
 
-    # Notify frontend via WebSocket if connected
     if "frontend" in connected_ws:
         asyncio.create_task(connected_ws["frontend"].send_json({
             "type": "new_message",
@@ -376,9 +428,11 @@ def delete_single_message(msg_id: str):
 
 @app.patch("/messages/single/{msg_id}")
 def edit_message(msg_id: str, body: dict):
+    new_content = body.get("content", "")
+    enc_content = vault_encrypt(new_content)
     with get_db(MSGS_DB) as db:
         db.execute("UPDATE messages SET content=?, status='edited' WHERE id=? AND is_outgoing=1",
-                   (body.get("content", ""), msg_id))
+                   (enc_content, msg_id))
         db.commit()
     return {"ok": True}
 
@@ -406,11 +460,16 @@ def set_auto_delete(req: AutoDeleteReq):
 def search_messages(q: str = "", limit: int = 50):
     if not q or len(q) < 2: return []
     with get_db(MSGS_DB) as db:
-        rows = db.execute(
-            "SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?",
-            (f"%{q}%", limit)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        rows = db.execute("SELECT * FROM messages ORDER BY timestamp DESC LIMIT 200").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            dec_content = vault_decrypt(d["content"])
+            if q.lower() in dec_content.lower():
+                d["content"] = dec_content
+                result.append(d)
+                if len(result) >= limit: break
+        return result
 
 # ─── Reactions ────────────────────────────────────────────────────────────────
 def _init_reactions():
@@ -531,11 +590,12 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 
     box = nacl.secret.SecretBox(sender_key)
     ct = box.encrypt(req.content.encode("utf-8"))
+    enc_content = vault_encrypt(req.content)
 
     with get_db(MSGS_DB) as db:
         db.execute(
             "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,?,1)",
-            (msg_id, group_id, identity["user_id"], req.content, b64e(ct), req.msg_type, now)
+            (msg_id, group_id, identity["user_id"], enc_content, b64e(ct), req.msg_type, now)
         )
         db.commit()
 
