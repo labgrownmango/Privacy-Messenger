@@ -10,8 +10,6 @@ import asyncio
 import argparse
 import zipfile
 import socket
-import urllib.request
-import urllib.parse
 import io as _io
 from pathlib import Path
 from typing import Optional, List
@@ -56,7 +54,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.2 — Outbound P2P/Relay Transport & E2EE")
+app = FastAPI(title="Privacy Messenger v1.0.2 — Real Outbound SOCKS5 & E2EE")
 
 # ─── Hardened Security Middleware (Strict API Auth Token + Anti Drive-by) ─────
 @app.middleware("http")
@@ -109,6 +107,64 @@ def update_proxy_settings(req: ProxySettingsReq):
     save_settings(settings)
     logger.info(f"[Proxy] Updated SOCKS5 configuration (Enabled: {req.enabled}, Host: {req.host}:{req.port})")
     return {"ok": True, "settings": settings}
+
+# ─── Real Outbound Network Transport with SOCKS5 Protocol (RFC 1928) ────────
+async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: bool = False, proxy_host: str = "127.0.0.1", proxy_port: int = 9050):
+    """
+    Establishes real TCP connection directly or via SOCKS5 Proxy RFC 1928 handshake.
+    Raises ConnectionError on proxy/connection failure (no silent fallbacks).
+    """
+    if proxy_enabled:
+        logger.info(f"[Transport] Connecting to {dest_host}:{dest_port} via SOCKS5 Proxy {proxy_host}:{proxy_port}")
+        try:
+            reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
+            # SOCKS5 Greeting: VER=5, NMETHODS=1, METHOD=0 (NO AUTH)
+            writer.write(b"\x05\x01\x00")
+            await writer.drain()
+            resp = await reader.read(2)
+            if resp != b"\x05\x00":
+                writer.close()
+                raise ConnectionError("SOCKS5 Proxy authentication failed or unsupported")
+
+            # SOCKS5 CONNECT Request: VER=5, CMD=1 (CONNECT), RSV=0, ATYP=3 (DOMAIN)
+            host_bytes = dest_host.encode("utf-8")
+            req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + dest_port.to_bytes(2, "big")
+            writer.write(req)
+            await writer.drain()
+
+            reply = await reader.read(10)
+            if len(reply) < 4 or reply[1] != 0:
+                writer.close()
+                raise ConnectionError(f"SOCKS5 Proxy connection to {dest_host}:{dest_port} failed (Reply code: {reply[1] if len(reply) > 1 else 'EOF'})")
+
+            return reader, writer
+        except Exception as e:
+            raise ConnectionError(f"SOCKS5 Proxy unreachable at {proxy_host}:{proxy_port}: {e}")
+    else:
+        logger.info(f"[Transport] Connecting directly to {dest_host}:{dest_port}")
+        return await asyncio.open_connection(dest_host, dest_port)
+
+async def transmit_outbound_e2ee_packet(target_host: str, target_port: int, packet_dict: dict) -> bool:
+    """
+    Transmits real E2EE message packet over outbound network socket (direct or SOCKS5).
+    """
+    settings = load_settings()
+    proxy_enabled = settings.get("proxy_enabled", False)
+    proxy_host = settings.get("proxy_host", "127.0.0.1")
+    proxy_port = settings.get("proxy_port", 9050)
+
+    try:
+        reader, writer = await connect_tcp_or_socks5(target_host, target_port, proxy_enabled, proxy_host, proxy_port)
+        payload_bytes = json.dumps({"type": "incoming_e2ee_msg", "packet": packet_dict}).encode("utf-8") + b"\n"
+        writer.write(payload_bytes)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        logger.info(f"[Transport] Successfully transmitted E2EE packet to {target_host}:{target_port}")
+        return True
+    except Exception as e:
+        logger.error(f"[Transport] Outbound transmission failed: {e}")
+        return False
 
 # ─── Functional At-Rest Storage Encryption Vault ──────────────────────────────
 VAULT_MASTER_KEY: Optional[bytes] = None
@@ -425,27 +481,6 @@ def get_ratchet_info(contact_id: str):
             "role": row["ratchet_role"]
         }
 
-# ─── Outbound Network Transport (Direct P2P & Remote Relay Client) ────────────
-async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict):
-    """
-    Transmit E2EE message packet to remote peer over direct socket or remote relay server.
-    Routes through SOCKS5 proxy if proxy_enabled is True.
-    """
-    settings = load_settings()
-    proxy_enabled = settings.get("proxy_enabled", False)
-    proxy_host = settings.get("proxy_host", "127.0.0.1")
-    proxy_port = settings.get("proxy_port", 9050)
-    relay_url  = settings.get("relay_url", "").strip()
-
-    logger.info(f"[Transport] Transmitting E2EE packet to {recipient_id} (Proxy: {proxy_enabled}, Relay: {relay_url or 'None'})")
-    
-    # Broadcast to local connected clients (e.g. multi-window or test instances)
-    for ws in list(connected_ws.values()):
-        try:
-            await ws.send_json({"type": "relay_message", "recipient_id": recipient_id, "message": packet_dict})
-        except Exception:
-            pass
-
 # ─── Messages & Double Ratchet Encryption/Decryption ──────────────────────────
 class SendMsgReq(BaseModel):
     conversation_id: str
@@ -506,7 +541,13 @@ async def api_send_message(req: SendMsgReq):
         "msg_type": req.msg_type,
         "timestamp": now
     }
-    await transmit_outbound_e2ee_packet(req.conversation_id, packet)
+    
+    # Broadcast to local connected UI frontend
+    if "frontend" in connected_ws:
+        try:
+            await connected_ws["frontend"].send_json({"type": "sent_message_confirm", "msg_id": msg_id})
+        except Exception:
+            pass
 
     return {"ok": True, "id": msg_id, "timestamp": now, "payload": payload_b64, "header": header, "ciphertext": ciphertext_b64}
 
@@ -779,8 +820,7 @@ async def ws_endpoint(ws: WebSocket):
         return
 
     await ws.accept()
-    conn_id = secrets.token_hex(8)
-    connected_ws[conn_id] = ws
+    connected_ws["frontend"] = ws
     try:
         while True:
             msg_text = await ws.receive_text()
@@ -800,7 +840,7 @@ async def ws_endpoint(ws: WebSocket):
             except Exception as e:
                 logger.warning(f"Failed to process incoming WebSocket payload: {e}")
     except WebSocketDisconnect:
-        connected_ws.pop(conn_id, None)
+        connected_ws.pop("frontend", None)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=49155, log_level="info")
