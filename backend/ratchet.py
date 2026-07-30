@@ -16,6 +16,8 @@ from typing import Dict, Optional, Tuple
 import nacl.public
 import nacl.secret
 import nacl.utils
+import nacl.bindings
+import nacl.exceptions
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_SKIP = 100          # max skipped message keys to cache
@@ -79,16 +81,29 @@ def unpad_plaintext(padded: bytes) -> bytes:
     return padded[4:4 + n]
 
 
-# ─── Message encryption/decryption ───────────────────────────────────────────
-def _encrypt_msg(mk: bytes, plaintext: bytes) -> bytes:
-    """Encrypt message with derived per-message key (ChaCha20-Poly1305 via NaCl SecretBox)."""
+# ─── Message AEAD Encryption/Decryption with Header AAD Authentication ────────
+def _encrypt_msg(mk: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    """
+    Encrypt message with ChaCha20-Poly1305 IETF AEAD binding the Header as Associated Data (AAD).
+    Prevents active MitM header tampering.
+    """
     enc_key = _hkdf(mk, b"", RATCHET_INFO_MSG, 32)
-    return nacl.secret.SecretBox(enc_key).encrypt(plaintext)
+    nonce = nacl.utils.random(12)
+    ciphertext = nacl.bindings.crypto_aead_chacha20poly1305_ietf_encrypt(plaintext, aad, nonce, enc_key)
+    return nonce + ciphertext
 
 
-def _decrypt_msg(mk: bytes, ciphertext: bytes) -> bytes:
+def _decrypt_msg(mk: bytes, ciphertext: bytes, aad: bytes = b"") -> bytes:
+    """
+    Decrypt message and verify Associated Data (AAD Header).
+    Raises CryptoError if header or ciphertext was tampered with.
+    """
     enc_key = _hkdf(mk, b"", RATCHET_INFO_MSG, 32)
-    return nacl.secret.SecretBox(enc_key).decrypt(ciphertext)
+    if len(ciphertext) < 12:
+        raise nacl.exceptions.CryptoError("Invalid ciphertext length")
+    nonce = ciphertext[:12]
+    raw_ct = ciphertext[12:]
+    return nacl.bindings.crypto_aead_chacha20poly1305_ietf_decrypt(raw_ct, aad, nonce, enc_key)
 
 
 # ─── Ratchet State ────────────────────────────────────────────────────────────
@@ -166,7 +181,7 @@ def ratchet_encrypt(state: RatchetState, plaintext: str) -> Tuple[dict, str]:
     """
     Encrypt plaintext, advance sending chain.
     Returns (header_dict, ciphertext_b64).
-    Pads plaintext before encrypting to hide length.
+    Pads plaintext before encrypting and binds header as AAD for AEAD integrity.
     """
     if state.cks is None:
         raise RuntimeError("Ratchet not ready: sending chain key is None (call init_as_sender first)")
@@ -180,8 +195,10 @@ def ratchet_encrypt(state: RatchetState, plaintext: str) -> Tuple[dict, str]:
     }
     state.ns += 1
 
+    aad = f"{header['dh']}:{header['pn']}:{header['n']}".encode("utf-8")
     padded = pad_plaintext(plaintext.encode("utf-8"))
-    ct = _encrypt_msg(mk, padded)
+    ct = _encrypt_msg(mk, padded, aad)
+
     # Immediately overwrite mk in memory (best-effort in Python)
     mk = b"\x00" * len(mk)
 
@@ -191,11 +208,13 @@ def ratchet_encrypt(state: RatchetState, plaintext: str) -> Tuple[dict, str]:
 def ratchet_decrypt(state: RatchetState, header: dict, ciphertext_b64: str) -> str:
     """
     Decrypt ciphertext, potentially performing a DH ratchet step.
+    Verifies Associated Data (Header AAD) to prevent MitM header tampering.
     Returns plaintext string.
     """
     their_dh_pk_b64 = header["dh"]
     pn = header["pn"]
     n  = header["n"]
+    aad = f"{their_dh_pk_b64}:{pn}:{n}".encode("utf-8")
     their_pk = nacl.public.PublicKey(b64d(their_dh_pk_b64))
 
     ct = b64d(ciphertext_b64)
@@ -204,7 +223,7 @@ def ratchet_decrypt(state: RatchetState, header: dict, ciphertext_b64: str) -> s
     skip_key = f"{their_dh_pk_b64}:{n}"
     if skip_key in state.mkskipped:
         mk = state.mkskipped.pop(skip_key)
-        return unpad_plaintext(_decrypt_msg(mk, ct)).decode("utf-8")
+        return unpad_plaintext(_decrypt_msg(mk, ct, aad)).decode("utf-8")
 
     # 2. DH ratchet step if sender used a new DH key
     if state.dhr is None or bytes(their_pk) != bytes(state.dhr):
@@ -217,7 +236,7 @@ def ratchet_decrypt(state: RatchetState, header: dict, ciphertext_b64: str) -> s
     state.ckr, mk = kdf_ck(state.ckr)
     state.nr += 1
 
-    plaintext = unpad_plaintext(_decrypt_msg(mk, ct)).decode("utf-8")
+    plaintext = unpad_plaintext(_decrypt_msg(mk, ct, aad)).decode("utf-8")
     mk = b"\x00" * len(mk)   # overwrite
     return plaintext
 
