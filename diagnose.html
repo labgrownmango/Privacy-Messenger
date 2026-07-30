@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/><title>PM Diagnose</title>
+<style>
+body{background:#0c0e14;color:#e8eaf6;font-family:monospace;padding:20px;font-size:13px;}
+.ok{color:#3ddbb4;}.err{color:#f05b6a;}.warn{color:#f0c05b;}
+pre{background:#181c28;padding:10px;border-radius:6px;margin:6px 0;white-space:pre-wrap;word-break:break-all;}
+</style></head>
+<body>
+<h2 style="color:#5865f0;">🔍 Privacy Messenger — Diagnose</h2>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out')
+function log(msg, cls='') { out.innerHTML += `<pre class="${cls}">${msg}</pre>` }
+
+log('Starte Diagnose…')
+
+// 1. Check electronAPI
+if (window.electronAPI) { log('✅ window.electronAPI vorhanden', 'ok') }
+else { log('❌ window.electronAPI FEHLT — Preload läuft nicht', 'err') }
+
+// 2. Check messenger
+if (window.messenger) { log('✅ window.messenger vorhanden', 'ok') }
+else { log('❌ window.messenger FEHLT — contextBridge fehlgeschlagen', 'err') }
+
+// 3. Test fetch to backend
+async function run() {
+  // Test backend
+  try {
+    const r = await fetch('http://127.0.0.1:49155/identity')
+    const j = await r.json()
+    log('✅ Backend erreichbar: ' + JSON.stringify(j).substring(0,100), 'ok')
+  } catch(e) { log('❌ Backend NICHT erreichbar: ' + e.message, 'err') }
+
+  // Test messenger.getIdentity
+  if (window.messenger) {
+    try {
+      const id = await window.messenger.getIdentity()
+      log('✅ messenger.getIdentity(): ' + JSON.stringify(id).substring(0,100), 'ok')
+    } catch(e) { log('❌ messenger.getIdentity() Fehler: ' + e.message, 'err') }
+  }
+
+  // Test QR
+  if (window.messenger) {
+    try {
+      const qr = await window.messenger.generateQR('test')
+      log(qr ? '✅ QR-Code generiert: ' + qr.substring(0,40)+'…' : '⚠️ QR null (qrcode Modul fehlt, Fallback aktiv)', qr ? 'ok' : 'warn')
+    } catch(e) { log('⚠️ generateQR Fehler: ' + e.message, 'warn') }
+  }
+
+  log('─── Diagnose abgeschlossen ───')
+}
+
+run().catch(e => log('FATAL: ' + e.message + '\n' + e.stack, 'err'))
+</script>
+</body></html>

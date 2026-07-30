@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+backend-dist/
+*.db
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

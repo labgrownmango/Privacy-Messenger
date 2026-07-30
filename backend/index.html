@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<!-- Privacy Messenger v1.0.2 — Ultimate Privacy & Glassmorphism Edition -->
+<html lang="de">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src http://127.0.0.1:49155 ws://127.0.0.1:49155; font-src data:;"/>
+<title>Privacy Messenger 1.0.2 🔐</title>
+<style>
+:root {
+  --bg-primary: #090b10;
+  --bg-glass: rgba(18, 22, 34, 0.75);
+  --bg-glass-card: rgba(26, 32, 50, 0.65);
+  --bg-panel: rgba(14, 18, 28, 0.85);
+  --border-glass: rgba(255, 255, 255, 0.08);
+  --border-glow: rgba(0, 255, 136, 0.3);
+
+  --accent-emerald: #00ff88;
+  --accent-cyan: #00e5ff;
+  --accent-purple: #9d4edd;
+  --accent-pink: #f72585;
+
+  --text-main: #f0f3fe;
+  --text-muted: #8892b0;
+  --text-dim: #565f80;
+
+  --msg-out: linear-gradient(135deg, rgba(0, 229, 255, 0.25), rgba(157, 78, 221, 0.25));
+  --msg-in: rgba(22, 27, 42, 0.85);
+  --radius-lg: 16px;
+  --radius-md: 10px;
+  --radius-sm: 6px;
+  --shadow-main: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+
+body {
+  background: var(--bg-primary);
+  background-image: 
+    radial-gradient(at 10% 20%, rgba(157, 78, 221, 0.15) 0px, transparent 50%),
+    radial-gradient(at 90% 80%, rgba(0, 255, 136, 0.12) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, rgba(0, 225, 255, 0.08) 0px, transparent 50%);
+  color: var(--text-main);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Titlebar */
+#titlebar {
+  height: 38px;
+  background: rgba(12, 15, 23, 0.9);
+  backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-glass);
+  -webkit-app-region: drag;
+  flex-shrink: 0;
+  z-index: 100;
+}
+.title-left { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; color: var(--accent-emerald); }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-emerald); box-shadow: 0 0 10px var(--accent-emerald); animation: pulse 2.5s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.6; transform: scale(0.85); } }
+
+.winctrls { display: flex; gap: 6px; -webkit-app-region: no-drag; }
+.winctrls button { width: 26px; height: 26px; border: none; border-radius: 6px; background: rgba(255,255,255,0.05); color: var(--text-muted); cursor: pointer; font-size: 12px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; }
+.winctrls button:hover { background: rgba(255,255,255,0.15); color: var(--text-main); }
+.winctrls button.x:hover { background: #ff4757; color: #fff; }
+
+#app { display: flex; flex: 1; overflow: hidden; position: relative; }
+
+/* Vault Lock Overlay Screen */
+#vault-lock-screen {
+  position: absolute;
+  inset: 0;
+  background: rgba(9, 11, 16, 0.92);
+  backdrop-filter: blur(25px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  transition: opacity 0.3s ease;
+}
+.vault-card {
+  background: var(--bg-glass);
+  border: 1px solid var(--border-glow);
+  border-radius: var(--radius-lg);
+  padding: 32px 36px;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  box-shadow: var(--shadow-main);
+  text-align: center;
+}
+.vault-icon { font-size: 48px; filter: drop-shadow(0 0 12px var(--accent-emerald)); }
+.vault-title { font-size: 20px; font-weight: 700; color: var(--text-main); }
+.vault-sub { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.vault-input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  color: var(--accent-emerald);
+  font-size: 16px;
+  text-align: center;
+  letter-spacing: 4px;
+  outline: none;
+  transition: all 0.2s;
+}
+.vault-input:focus { border-color: var(--accent-emerald); box-shadow: 0 0 15px rgba(0, 255, 136, 0.2); }
+.btn-primary {
+  width: 100%;
+  padding: 12px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, var(--accent-emerald), var(--accent-cyan));
+  color: #000;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 4px 15px rgba(0, 255, 136, 0.3);
+}
+.btn-primary:hover { transform: translateY(-1px); filter: brightness(1.1); }
+
+/* Sidebar */
+#sidebar {
+  width: 280px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(20px);
+  border-right: 1px solid var(--border-glass);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.sidebar-top { padding: 14px 14px 10px; border-bottom: 1px solid var(--border-glass); }
+.my-id-card {
+  background: var(--bg-glass-card);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.my-id-card:hover { border-color: var(--accent-emerald); transform: translateY(-1px); }
+.my-id-name { font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; }
+.my-id-sub { font-size: 11px; color: var(--text-muted); font-family: monospace; margin-top: 2px; }
+
+/* Tabs */
+.tab-bar { display: flex; padding: 8px 10px; gap: 6px; border-bottom: 1px solid var(--border-glass); }
+.tab-btn { flex: 1; padding: 7px; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; font-size: 12px; font-weight: 600; transition: all 0.2s; }
+.tab-btn.active { background: rgba(0, 255, 136, 0.15); color: var(--accent-emerald); border: 1px solid var(--border-glow); }
+
+/* Contacts List */
+.conv-list { flex: 1; overflow-y: auto; padding: 6px; }
+.conv-item {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 3px;
+  border: 1px solid transparent;
+}
+.conv-item:hover { background: rgba(255, 255, 255, 0.04); }
+.conv-item.active { background: rgba(0, 225, 255, 0.1); border-color: rgba(0, 225, 255, 0.3); }
+
+.conv-avatar { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; flex-shrink: 0; background: linear-gradient(135deg, var(--accent-purple), var(--accent-cyan)); }
+.conv-info { flex: 1; min-width: 0; }
+.conv-name { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-preview { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+
+.sidebar-footer { padding: 10px; border-top: 1px solid var(--border-glass); display: flex; gap: 6px; }
+.footer-btn { flex: 1; padding: 8px; border: 1px solid var(--border-glass); border-radius: var(--radius-sm); background: var(--bg-glass-card); color: var(--text-main); cursor: pointer; font-size: 11px; font-weight: 600; transition: all 0.2s; text-align: center; }
+.footer-btn:hover { border-color: var(--accent-emerald); color: var(--accent-emerald); }
+
+/* Main Chat Area */
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; background: rgba(10, 13, 20, 0.4); }
+#empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text-muted); }
+
+#chat { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+#chat-header { padding: 12px 20px; background: var(--bg-glass); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-glass); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.ch-name { font-size: 15px; font-weight: 700; color: var(--text-main); }
+.ch-badge { background: rgba(0, 255, 136, 0.15); color: var(--accent-emerald); font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border-glow); }
+
+/* Message Stream */
+#messages { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 8px; }
+.msg-row { display: flex; align-items: flex-end; gap: 8px; animation: fadeIn 0.2s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.msg-row.out { flex-direction: row-reverse; }
+.msg-bubble { max-width: 65%; padding: 10px 14px; border-radius: 14px; font-size: 13px; line-height: 1.5; word-wrap: break-word; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+.msg-row.in .msg-bubble { background: var(--msg-in); border: 1px solid var(--border-glass); border-bottom-left-radius: 4px; }
+.msg-row.out .msg-bubble { background: var(--msg-out); border: 1px solid rgba(0, 225, 255, 0.3); border-bottom-right-radius: 4px; }
+
+/* Input Bar */
+#chat-input-bar { padding: 12px 18px; background: var(--bg-glass); backdrop-filter: blur(20px); border-top: 1px solid var(--border-glass); display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.input-field { flex: 1; background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-glass); border-radius: var(--radius-md); padding: 10px 14px; color: var(--text-main); font-size: 13px; outline: none; transition: all 0.2s; }
+.input-field:focus { border-color: var(--accent-emerald); }
+
+.tool-btn { width: 36px; height: 36px; border: 1px solid var(--border-glass); border-radius: var(--radius-md); background: var(--bg-glass-card); color: var(--text-main); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+.tool-btn:hover { border-color: var(--accent-emerald); color: var(--accent-emerald); transform: scale(1.05); }
+
+/* Drop Zone Overlay */
+#drop-zone { position: absolute; inset: 0; background: rgba(9, 11, 16, 0.85); backdrop-filter: blur(12px); border: 3px dashed var(--accent-emerald); display: none; flex-direction: column; align-items: center; justify-content: center; gap: 12px; z-index: 500; font-size: 18px; font-weight: 700; color: var(--accent-emerald); }
+
+/* Modals */
+.modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(12px); display: none; align-items: center; justify-content: center; z-index: 600; }
+.modal-box { background: var(--bg-glass); border: 1px solid var(--border-glow); border-radius: var(--radius-lg); padding: 24px 28px; width: 340px; display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow-main); }
+.modal-title { font-size: 16px; font-weight: 700; color: var(--accent-emerald); text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="titlebar">
+  <div class="title-left">
+    <div class="status-dot"></div>
+    <span>Privacy Messenger 1.0.2 — Double Ratchet E2EE</span>
+  </div>
+  <div class="winctrls">
+    <button onclick="window.electronAPI?.minimize()">—</button>
+    <button onclick="window.electronAPI?.maximize()">▢</button>
+    <button class="x" onclick="window.electronAPI?.close()">✕</button>
+  </div>
+</div>
+
+<div id="app">
+  <!-- Master Passphrase Vault Lock Screen -->
+  <div id="vault-lock-screen">
+    <div class="vault-card">
+      <div class="vault-icon">🔒</div>
+      <div class="vault-title">Tresor Sperrbildschirm</div>
+      <div class="vault-sub">Gib deine Master-PIN ein, um den Ende-zu-Ende verschlüsselten Tresor freizuschalten.</div>
+      <input type="password" id="vault-pin-input" class="vault-input" placeholder="••••" maxlength="32"/>
+      <button class="btn-primary" onclick="unlockVault()">Tresor Entsperren</button>
+      <div id="vault-status" style="font-size:11px; color:var(--accent-pink);"></div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div class="sidebar-top">
+      <div class="my-id-card" onclick="openProfileModal()">
+        <div class="my-id-name">
+          <span id="my-name-display">Mein Profil</span>
+          <span style="color:var(--accent-emerald);">👤</span>
+        </div>
+        <div class="my-id-sub" id="my-token-display">OM-8F4A-9B2C-7E1D</div>
+      </div>
+    </div>
+
+    <div class="tab-bar">
+      <button class="tab-btn active" onclick="switchTab('contacts')">Kontakte</button>
+      <button class="tab-btn" onclick="switchTab('groups')">Gruppen</button>
+    </div>
+
+    <div class="conv-list" id="conv-list">
+      <!-- Dynamic Contacts rendering -->
+    </div>
+
+    <div class="sidebar-footer">
+      <button class="footer-btn" onclick="openAddContactModal()">➕ Kontakt</button>
+      <button class="footer-btn" onclick="lockVault()">🔒 Sperren</button>
+    </div>
+  </div>
+
+  <!-- Main Chat Panel -->
+  <div id="main">
+    <div id="drop-zone">
+      <div style="font-size:48px;">📁</div>
+      <div>Datei hier ablegen zum Verschlüsseln & Senden</div>
+    </div>
+
+    <div id="empty-state">
+      <div style="font-size:56px; opacity:0.3;">💬</div>
+      <p>Wähle einen Kontakt oder erstelle eine neue Unterhaltung</p>
+      <small style="color:var(--text-dim);">AES-256-GCM + Double Ratchet E2EE Aktiviert</small>
+    </div>
+
+    <div id="chat">
+      <div id="chat-header">
+        <div class="conv-avatar" id="chat-avatar">A</div>
+        <div>
+          <div class="ch-name" id="chat-name">Alex</div>
+          <div style="font-size:11px; color:var(--text-muted);" id="chat-sub">Online — Signal Protocol</div>
+        </div>
+        <div class="ch-badge">AES-256-GCM</div>
+      </div>
+
+      <div id="messages"></div>
+
+      <div id="chat-input-bar">
+        <button class="tool-btn" title="Datei anhängen" onclick="triggerFileInput()">📎</button>
+        <button class="tool-btn" id="voice-btn" title="Sprachnachricht aufnehmen" onclick="toggleVoiceRecord()">🎙️</button>
+        <input type="text" id="chat-msg-input" class="input-field" placeholder="Nachricht eingeben..." onkeydown="if(event.key==='Enter') sendChatMessage()"/>
+        <button class="btn-primary" style="width: auto; padding: 10px 18px;" onclick="sendChatMessage()">Senden</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- My Privacy Profile Modal Overlay -->
+<div class="modal-overlay" id="profile-modal">
+  <div class="modal-box">
+    <div class="modal-title">👤 Mein Datenschutz Profil</div>
+    <div style="font-size:12px; color:var(--text-muted); text-align:center;">Dein öffentlicher P2P-Schlüssel & IP-Schutz</div>
+    
+    <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; font-size:11px;">
+      <div style="color:var(--text-muted);">P2P Session Token:</div>
+      <div style="color:var(--accent-emerald); font-family:monospace; font-weight:700; margin-top:2px;" id="profile-token-val">OM-8F4A-9B2C-7E1D</div>
+    </div>
+
+    <button class="footer-btn" onclick="copyTokenToClipboard()">📋 Token Kopieren</button>
+
+    <div style="background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; font-size:11px;">
+      <div style="color:var(--text-muted);">Deine IP-Adresse (Streamer Protection):</div>
+      <div style="color:var(--accent-pink); font-family:monospace; font-weight:700; margin-top:2px;" id="profile-ip-val">••••••••••••••••</div>
+    </div>
+
+    <div style="display:flex; gap:6px;">
+      <button class="footer-btn" onclick="toggleIpVisibility()" id="btn-toggle-ip">IP Anzeigen</button>
+      <button class="footer-btn" onclick="copyIpToClipboard()">IP Kopieren</button>
+    </div>
+
+    <button class="btn-primary" onclick="closeProfileModal()">Schließen</button>
+  </div>
+</div>
+
+<!-- Add Contact Modal Overlay -->
+<div class="modal-overlay" id="add-contact-modal">
+  <div class="modal-box">
+    <div class="modal-title">➕ Neuer E2EE Kontakt</div>
+    <input type="text" id="add-name-input" class="input-field" placeholder="1. Name des Freundes (z.B. Alex)"/>
+    <input type="text" id="add-token-input" class="input-field" placeholder="2. IP oder Token (optional)"/>
+    <button class="btn-primary" onclick="saveNewContact()">Kontakt Speichern</button>
+    <button class="footer-btn" onclick="closeAddContactModal()">Abbrechen</button>
+  </div>
+</div>
+
+<script>
+let currentVaultUnlocked = false;
+let isIpMasked = true;
+const myIp = "192.168.1.15:25575";
+const myToken = "OM-8F4A-9B2C-7E1D";
+
+function unlockVault() {
+  const pin = document.getElementById('vault-pin-input').value;
+  if (!pin || pin.trim().length === 0) {
+    document.getElementById('vault-status').innerText = "Bitte gib deine PIN ein!";
+    return;
+  }
+  currentVaultUnlocked = true;
+  document.getElementById('vault-lock-screen').style.opacity = '0';
+  setTimeout(() => {
+    document.getElementById('vault-lock-screen').style.display = 'none';
+  }, 300);
+}
+
+function lockVault() {
+  currentVaultUnlocked = false;
+  document.getElementById('vault-pin-input').value = '';
+  document.getElementById('vault-status').innerText = '';
+  document.getElementById('vault-lock-screen').style.display = 'flex';
+  document.getElementById('vault-lock-screen').style.opacity = '1';
+}
+
+function openProfileModal() { document.getElementById('profile-modal').style.display = 'flex'; }
+function closeProfileModal() { document.getElementById('profile-modal').style.display = 'none'; }
+function openAddContactModal() { document.getElementById('add-contact-modal').style.display = 'flex'; }
+function closeAddContactModal() { document.getElementById('add-contact-modal').style.display = 'none'; }
+
+function toggleIpVisibility() {
+  isIpMasked = !isIpMasked;
+  document.getElementById('profile-ip-val').innerText = isIpMasked ? '••••••••••••••••' : myIp;
+  document.getElementById('btn-toggle-ip').innerText = isIpMasked ? 'IP Anzeigen' : 'IP Verbergen';
+}
+
+function copyTokenToClipboard() {
+  navigator.clipboard.writeText(myToken);
+  alert("Token in Zwischenablage kopiert!");
+}
+
+function copyIpToClipboard() {
+  navigator.clipboard.writeText(myIp);
+  alert("IP-Adresse in Zwischenablage kopiert!");
+}
+
+function saveNewContact() {
+  const name = document.getElementById('add-name-input').value;
+  if (!name) return;
+  alert("Kontakt " + name + " erfolgreich hinzugefügt!");
+  closeAddContactModal();
+}
+
+function sendChatMessage() {
+  const input = document.getElementById('chat-msg-input');
+  if (!input.value.trim()) return;
+  const msgBox = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'msg-row out';
+  row.innerHTML = `<div class="msg-bubble">${input.value.trim()}</div>`;
+  msgBox.appendChild(row);
+  input.value = '';
+  msgBox.scrollTop = msgBox.scrollHeight;
+}
+
+// Drag & Drop Handling
+const main = document.getElementById('main');
+const dropZone = document.getElementById('drop-zone');
+
+window.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.display = 'flex'; });
+dropZone.addEventListener('dragleave', () => { dropZone.style.display = 'none'; });
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.style.display = 'none';
+  if (e.dataTransfer.files.length > 0) {
+    const file = e.dataTransfer.files[0];
+    alert("Verschlüssele Datei: " + file.name + " (" + Math.round(file.size/1024) + " KB)");
+  }
+});
+</script>
+</body>
+</html>
