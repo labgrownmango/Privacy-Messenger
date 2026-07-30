@@ -41,8 +41,10 @@ npm run build
 
 ## 📄 Lizenz
 
-Dieses Projekt steht unter einer **Nicht-Kommerziellen & Eingeschränkten Weitergabe-Lizenz**:
-- ✅ **Erlaubt:** Ansehen, Kompilieren, Modifizieren und Weitergeben im privaten/nicht-kommerziellen Rahmen (z. B. an Freunde).
-- ❌ **Verboten:** Kommerzielle Nutzung (Verkauf/Monetarisierung) sowie groß angelegte Massen-Weiterverteilung oder Hosting auf kommerziellen Portalen ohne schriftliche Genehmigung der Urheber.
+Dieses Projekt steht unter der **PolyForm Noncommercial License 1.0.0 (mit Rechteinhaber-Vorbehalt)**:
+- ✅ **Erlaubt:** Ansehen, Kompilieren, Modifizieren und Weitergeben für nicht-kommerzielle Zwecke.
+- ❌ **Verboten für Dritte:** Kommerzielle Nutzung/Monetarisierung und Massen-Weiterverteilung ohne schriftliche Genehmigung.
+- ⚖️ **Rechteinhaber-Vorbehalt:** Offizielle Releases und Monetarisierung durch die Urheber (auf GitHub, Modrinth etc.) sind ausdrücklich gestattet.
+- 🏛️ **Gerichtsstand:** Deutsches Recht.
 
 Siehe die [LICENSE](LICENSE) Datei für Details.
