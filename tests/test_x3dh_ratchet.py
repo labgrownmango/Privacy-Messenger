@@ -8,11 +8,13 @@ Validates:
 4. Strict Security Boundary Tests:
    - Forged SPK Signature Detection (strict nacl.exceptions.BadSignatureError)
    - Header AEAD AAD Tampering Detection (strict nacl.exceptions.CryptoError)
-   - Forged Group Message Signature Detection on FastAPI Endpoint Layer (HTTPException 400)
+   - Forged Group Message Signature Detection on FastAPI Endpoint Layer (strict HTTP 400 Signature Failure)
+   - Unregistered Group Member Detection on FastAPI Endpoint Layer (strict HTTP 403 Membership Failure)
 """
 
 import sys
 import json
+import time
 import base64
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -29,10 +31,11 @@ from ratchet import (
     x3dh_sender_derive, x3dh_receiver_derive
 )
 
-# Import FastAPI server endpoints and helpers
+# Import FastAPI server endpoints and DB helpers
+import server
 from server import (
-    app, API_TOKEN, unlock_vault_session,
-    IncomingMsg, ReceiveGroupMsgReq, receive_group_message
+    app, API_TOKEN, vault_encrypt, get_db,
+    GROUPS_DB, ReceiveGroupMsgReq, receive_group_message
 )
 
 def test_full_x3dh_and_double_ratchet_roundtrip():
@@ -155,39 +158,98 @@ def test_strict_negative_security_tamper_detection():
         print("[OK] Header AAD tampering strictly rejected with PyNaCl CryptoError.")
 
 def test_fastapi_group_endpoint_forged_signature():
-    print("\n=== [TEST 3] FastAPI Group Endpoint Forged Signature Verification ===")
+    print("\n=== [TEST 3] FastAPI Group Endpoint Forged Signature & Membership Verification ===")
     
-    # Initialize vault session for server endpoints
-    unlock_vault_session("TEST_PIN_1234")
+    # Set active Vault Master Key for test environment
+    server.VAULT_MASTER_KEY = nacl.utils.random(32)
 
-    group_id = "test_group_security_99"
+    # 2. Create REAL Group entry in GROUPS_DB with vault-encrypted sender key
+    group_id = "real_group_sec_test_100"
     sender_key = nacl.utils.random(32)
-    eve_sign_sk = nacl.signing.SigningKey.generate()
+    enc_sender_key = vault_encrypt(b64e(sender_key))
 
-    # Create encrypted group payload with Eve's forged signature
-    group_content = "Malicious forged group announcement"
-    forged_sig = eve_sign_sk.sign(group_content.encode("utf-8")).signature
+    with get_db(GROUPS_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO groups (group_id, name, description, sender_key, created_by, created_at) VALUES (?,?,?,?,?,?)",
+            (group_id, "Real Security Group", "Test Group", enc_sender_key, "admin_user", int(time.time()))
+        )
+        db.commit()
 
-    payload_dict = {
-        "content": group_content,
-        "signature": b64e(forged_sig),
-        "sender_id": "eve_user_id"
+    # 3. Register REAL member Alice in group_members
+    alice_id = "alice_registered_member"
+    alice_sign_sk = nacl.signing.SigningKey.generate()
+    alice_sign_pk = alice_sign_sk.verify_key
+    alice_dh_pk = nacl.public.PrivateKey.generate().public_key
+
+    with get_db(GROUPS_DB) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO group_members (group_id, user_id, display_name, sign_pk, dh_pk, role, joined_at) VALUES (?,?,?,?,?,?,?)",
+            (group_id, alice_id, "Alice", b64e(bytes(alice_sign_pk)), b64e(bytes(alice_dh_pk)), "member", int(time.time()))
+        )
+        db.commit()
+
+    # --- TEST 3A: Valid Group Message Transmission & Signature Verification ---
+    content_valid = "Kritische Sicherheitsmeldung an alle Gruppenmitglieder"
+    sig_valid = alice_sign_sk.sign(content_valid.encode("utf-8")).signature
+
+    payload_valid = {
+        "content": content_valid,
+        "signature": b64e(sig_valid),
+        "sender_id": alice_id
     }
 
     box = nacl.secret.SecretBox(sender_key)
-    ciphertext_bytes = box.encrypt(json.dumps(payload_dict).encode("utf-8"))
-    req = ReceiveGroupMsgReq(group_id=group_id, ciphertext=b64e(ciphertext_bytes))
+    ct_valid = box.encrypt(json.dumps(payload_valid).encode("utf-8"))
+    req_valid = ReceiveGroupMsgReq(group_id=group_id, ciphertext=b64e(ct_valid))
 
-    # Test actual FastAPI server endpoint receive_group_message()
+    res_valid = receive_group_message(group_id=group_id, req=req_valid)
+    assert res_valid["ok"] == True
+    assert res_valid["signature_verified"] == True
+    assert res_valid["decrypted"] == content_valid
+    print("[OK] Valid Group Message successfully decrypted and Ed25519 signature verified!")
+
+    # --- TEST 3B: Forged Group Message Signature (Attacker Eve pretending to be Alice) ---
+    eve_sign_sk = nacl.signing.SigningKey.generate()
+    content_forged = "Gefälschte Nachricht von Eve"
+    forged_sig = eve_sign_sk.sign(content_forged.encode("utf-8")).signature # Signed with Eve's key!
+
+    payload_forged = {
+        "content": content_forged,
+        "signature": b64e(forged_sig),
+        "sender_id": alice_id # Pretending to be Alice!
+    }
+
+    ct_forged = box.encrypt(json.dumps(payload_forged).encode("utf-8"))
+    req_forged = ReceiveGroupMsgReq(group_id=group_id, ciphertext=b64e(ct_forged))
+
     try:
-        receive_group_message(group_id=group_id, req=req)
-        assert False, "Security Violation: FastAPI endpoint accepted group message with invalid sender/signature!"
+        receive_group_message(group_id=group_id, req=req_forged)
+        assert False, "Security Violation: Forged signature for registered member was NOT rejected!"
     except HTTPException as http_ex:
-        assert http_ex.status_code in (400, 403, 404), f"Unexpected HTTP status code: {http_ex.status_code}"
-        print(f"[OK] FastAPI Endpoint receive_group_message() correctly rejected forged payload with HTTP {http_ex.status_code}: {http_ex.detail}")
+        assert http_ex.status_code == 400, f"Expected HTTP 400 Signature Failure, got {http_ex.status_code}"
+        assert "signature verification failed" in str(http_ex.detail).lower()
+        print(f"[OK] Forged Group Message Signature strictly rejected with HTTP 400: '{http_ex.detail}'")
+
+    # --- TEST 3C: Unregistered Group Member Attempt ---
+    payload_unregistered = {
+        "content": "Unbefugter Gruppenbeitrag",
+        "signature": b64e(forged_sig),
+        "sender_id": "eve_unregistered_user"
+    }
+
+    ct_unregistered = box.encrypt(json.dumps(payload_unregistered).encode("utf-8"))
+    req_unregistered = ReceiveGroupMsgReq(group_id=group_id, ciphertext=b64e(ct_unregistered))
+
+    try:
+        receive_group_message(group_id=group_id, req=req_unregistered)
+        assert False, "Security Violation: Unregistered group member message was NOT rejected!"
+    except HTTPException as http_ex:
+        assert http_ex.status_code == 403, f"Expected HTTP 403 Membership Failure, got {http_ex.status_code}"
+        assert "not registered in group" in str(http_ex.detail).lower()
+        print(f"[OK] Unregistered Group Member strictly rejected with HTTP 403: '{http_ex.detail}'")
 
 if __name__ == "__main__":
     test_full_x3dh_and_double_ratchet_roundtrip()
     test_strict_negative_security_tamper_detection()
     test_fastapi_group_endpoint_forged_signature()
-    print("\nALL FASTAPI INTEGRATION & STRICT SECURITY BOUNDARY TESTS PASSED 100% SUCCESSFULLY!")
+    print("\nALL FASTAPI INTEGRATION & RIGOROUS SECURITY BOUNDARY TESTS PASSED 100% SUCCESSFULLY!")

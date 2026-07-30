@@ -460,7 +460,9 @@ def migrate():
         cols = [r[1] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
         if "auto_delete_at" not in cols:
             db.execute("ALTER TABLE messages ADD COLUMN auto_delete_at INTEGER DEFAULT NULL")
-            db.commit()
+        if "msg_type" not in cols:
+            db.execute("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT 'text'")
+        db.commit()
 
     with get_db(CONTACTS_DB) as db:
         cols = [r[1] for r in db.execute("PRAGMA table_info(contacts)").fetchall()]
@@ -470,7 +472,7 @@ def migrate():
         if "spk_pk" not in cols:
             db.execute("ALTER TABLE contacts ADD COLUMN spk_pk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE contacts ADD COLUMN spk_sig TEXT DEFAULT NULL")
-            db.commit()
+        db.commit()
 
     with get_db(KEYS_DB) as db:
         cols = [r[1] for r in db.execute("PRAGMA table_info(identity)").fetchall()]
@@ -478,7 +480,7 @@ def migrate():
             db.execute("ALTER TABLE identity ADD COLUMN spk_pk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE identity ADD COLUMN spk_sk TEXT DEFAULT NULL")
             db.execute("ALTER TABLE identity ADD COLUMN spk_sig TEXT DEFAULT NULL")
-            db.commit()
+        db.commit()
 migrate()
 
 # ─── Identity & Signed Prekeys for Real X3DH ─────────────────────────────────
@@ -756,8 +758,8 @@ async def api_send_message(req: SendMsgReq):
 
     with get_db(MSGS_DB) as db:
         db.execute(
-            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,1,?)",
-            (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now, initial_status)
+            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (msg_id, req.conversation_id, identity["user_id"], enc_content, payload_b64, req.msg_type, now, 1, initial_status)
         )
         db.commit()
 
@@ -779,8 +781,8 @@ def api_receive_message(req: IncomingMsg):
 
     with get_db(MSGS_DB) as db:
         db.execute(
-            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,0,'received')",
-            (req.id, req.sender_id, req.sender_id, enc_content, req.ciphertext, req.msg_type, req.timestamp)
+            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (req.id, req.sender_id, req.sender_id, enc_content, req.ciphertext, req.msg_type, req.timestamp, 0, "received")
         )
         db.commit()
 
@@ -961,7 +963,7 @@ def remove_group_member(group_id: str, user_id: str):
 def export_group_key(group_id: str, recipient_id: str):
     with get_db(GROUPS_DB) as db:
         g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
-        if not g: raise HTTPException(404, "Group not found")
+        if not g: raise HTTPException(404, f"Group {group_id} not found")
         dec_sender_key = vault_decrypt(g["sender_key"])
 
     st = get_or_create_ratchet_session(recipient_id, is_sender=True)
@@ -979,7 +981,7 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 
     with get_db(GROUPS_DB) as db:
         g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
-        if not g: raise HTTPException(404, "Group not found")
+        if not g: raise HTTPException(404, f"Group {group_id} not found")
         sender_key = b64d(vault_decrypt(g["sender_key"]))
 
     # Sign group message payload with sender's Signing Key
@@ -993,8 +995,8 @@ def send_group_message(group_id: str, req: SendGroupMsgReq):
 
     with get_db(MSGS_DB) as db:
         db.execute(
-            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing) VALUES (?,?,?,?,?,?,1)",
-            (msg_id, group_id, identity["user_id"], enc_content, b64e(ct), req.msg_type, now)
+            "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (msg_id, group_id, identity["user_id"], enc_content, b64e(ct), req.msg_type, now, 1, "sent")
         )
         db.commit()
 
@@ -1012,7 +1014,7 @@ def receive_group_message(group_id: str, req: ReceiveGroupMsgReq):
     """
     with get_db(GROUPS_DB) as db:
         g = db.execute("SELECT sender_key FROM groups WHERE group_id=?", (group_id,)).fetchone()
-        if not g: raise HTTPException(404, "Group not found")
+        if not g: raise HTTPException(404, f"Group {group_id} not found")
         sender_key = b64d(vault_decrypt(g["sender_key"]))
 
     try:
@@ -1042,12 +1044,14 @@ def receive_group_message(group_id: str, req: ReceiveGroupMsgReq):
 
         with get_db(MSGS_DB) as db:
             db.execute(
-                "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,0,'received')",
-                (msg_id, group_id, sender_id, enc_content, req.ciphertext, "text", now)
+                "INSERT INTO messages (id, conversation_id, sender_id, content, ciphertext, msg_type, timestamp, is_outgoing, status) VALUES (?,?,?,?,?,?,?,?,?)",
+                (msg_id, group_id, sender_id, enc_content, req.ciphertext, "text", now, 0, "received")
             )
             db.commit()
 
         return {"ok": True, "decrypted": content, "sender_id": sender_id, "signature_verified": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[Group] Group message signature verification failed: {e}")
         raise HTTPException(400, f"Group message signature verification failed: {e}")
