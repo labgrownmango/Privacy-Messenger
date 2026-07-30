@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.9 — Zero-Leakage Sealed Sender Delivery Tokens")
+app = FastAPI(title="Privacy Messenger v1.1.0 — Anti-Squatting Shared-Secret Initial Delivery Tokens")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -166,16 +166,13 @@ async def register_delivery_token_on_relay(token: str):
         except Exception as e:
             logger.warning(f"[RelayWorker] Failed to register rotated token: {e}")
 
-def derive_initial_delivery_token(dh_pk_b64: str) -> str:
+def derive_shared_secret_initial_token(shared_secret: bytes) -> str:
     """
-    Deterministically derives initial 32-byte Delivery Token from contact's DH public key.
-    Ensures zero user_id leakage while guaranteeing delivery prior to first in-band token rotation.
+    Cryptographically derives an initial 32-byte Delivery Token from the X3DH Shared Master Secret.
+    Prevents Token-Squatting attacks because ONLY Alice and Bob know shared_secret.
+    Third parties with only public keys cannot predict or register this token.
     """
-    try:
-        raw_pk = b64d(dh_pk_b64)
-        return b64e(hashlib.sha256(raw_pk).digest())
-    except Exception:
-        return b64e(secrets.token_bytes(32))
+    return b64e(hashlib.sha256(shared_secret + b"pm-shared-secret-initial-token-v1").digest())
 
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     global relay_writer_stream
@@ -214,12 +211,11 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # Strict Zero-Leakage Sealed Delivery Token (NO user_id fallback)
+    # Anti-Squatting Delivery Token (Derived from shared secret or active contact delivery token)
     if contact and contact["delivery_token"]:
         recipient_delivery_token = contact["delivery_token"]
-    elif contact and contact["dh_pk"]:
-        recipient_delivery_token = derive_initial_delivery_token(contact["dh_pk"])
     else:
+        # Fallback to random 32-byte token
         recipient_delivery_token = b64e(secrets.token_bytes(32))
 
     if relay_writer_stream and not relay_writer_stream.is_closing():
@@ -272,7 +268,7 @@ async def start_relay_client_worker():
             if identity and relay_url:
                 my_delivery_token = identity.get("delivery_token")
                 if not my_delivery_token:
-                    my_delivery_token = derive_initial_delivery_token(identity["dh_pk"])
+                    my_delivery_token = b64e(secrets.token_bytes(32))
                     with get_db(KEYS_DB) as db:
                         db.execute("UPDATE identity SET delivery_token=? WHERE id=1", (my_delivery_token,))
                         db.commit()
@@ -583,7 +579,7 @@ def api_create_identity(req: CreateIdentityReq):
     spk_sig = sign_sk.sign(bytes(spk_pk)).signature
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
-    delivery_token = derive_initial_delivery_token(b64e(bytes(dh_pk)))
+    delivery_token = b64e(secrets.token_bytes(32))
 
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
@@ -648,12 +644,11 @@ def api_get_contacts():
 
 @app.post("/contacts")
 def api_add_contact(req: AddContactReq):
-    token = req.delivery_token or derive_initial_delivery_token(req.dh_pk)
     with get_db(CONTACTS_DB) as db:
         db.execute(
             """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, token, req.host, req.port, int(time.time()))
+            (req.user_id, req.display_name, req.sign_pk, req.dh_pk, req.spk_pk, req.spk_sig, req.delivery_token, req.host, req.port, int(time.time()))
         )
         db.commit()
     return {"ok": True}
@@ -712,6 +707,13 @@ def get_or_create_ratchet_session(contact_id: str, is_sender: bool, incoming_hea
             logger.info(f"[X3DH] Derived Receiver Master Shared Secret using received Ephemeral Key EK_A from {contact_id}")
         else:
             shared_secret = bytes(nacl.public.Box(my_dh_sk, their_dh_pk).shared_key())
+
+        # Anti-Squatting Initial Delivery Token derived from Shared Secret (Zero Knowledge to third parties)
+        if not contact["delivery_token"]:
+            initial_token = derive_shared_secret_initial_token(shared_secret)
+            with get_db(CONTACTS_DB) as c_db:
+                c_db.execute("UPDATE contacts SET delivery_token=? WHERE user_id=?", (initial_token, contact_id))
+                c_db.commit()
 
         if is_sender:
             st = init_as_sender(shared_secret, contact["dh_pk"], ek_a=ek_a)
