@@ -57,7 +57,7 @@ GROUPS_DB    = APP_DATA / "groups.db"
 VAULT_META   = APP_DATA / "vault.meta"
 SETTINGS_FILE= APP_DATA / "settings.json"
 
-app = FastAPI(title="Privacy Messenger v1.0.7 — Automatic In-Band Delivery Token Rotation")
+app = FastAPI(title="Privacy Messenger v1.0.8 — Synchronized Relay Token Rotation & Vault Fix")
 
 # ─── Hardened Security Middleware (Strict Mandatory API Auth Token) ───────────
 @app.middleware("http")
@@ -142,6 +142,30 @@ async def connect_tcp_or_socks5(dest_host: str, dest_port: int, proxy_enabled: b
         logger.info(f"[Transport] Connecting directly to {dest_host}:{dest_port}")
         return await asyncio.open_connection(dest_host, dest_port)
 
+async def register_delivery_token_on_relay(token: str):
+    """
+    Immediately registers a newly rotated Delivery Token on the active Relay WebSocket stream.
+    Synchronizes local token rotation with the Relay Server.
+    """
+    global relay_writer_stream
+    if relay_writer_stream and not relay_writer_stream.is_closing():
+        try:
+            reg_payload = json.dumps({"type": "register_token", "delivery_token": token}).encode("utf-8")
+            reg_len = len(reg_payload)
+            reg_hdr = bytearray([0x81])
+            reg_mask = secrets.token_bytes(4)
+            if reg_len < 126: reg_hdr.append(0x80 | reg_len)
+            else: reg_hdr.extend([0x80 | 126] + list(reg_len.to_bytes(2, "big")))
+            reg_hdr.extend(reg_mask)
+            reg_masked = bytearray(reg_len)
+            for i in range(reg_len): reg_masked[i] = reg_payload[i] ^ reg_mask[i % 4]
+            
+            relay_writer_stream.write(reg_hdr + reg_masked)
+            await relay_writer_stream.drain()
+            logger.info(f"[RelayWorker] Dynamically registered rotated token on open stream: {token[:12]}...")
+        except Exception as e:
+            logger.warning(f"[RelayWorker] Failed to register rotated token: {e}")
+
 async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) -> bool:
     global relay_writer_stream
     settings = load_settings()
@@ -179,12 +203,8 @@ async def transmit_outbound_e2ee_packet(recipient_id: str, packet_dict: dict) ->
         except Exception as e:
             logger.warning(f"[Transport] Direct P2P transmission to {dest_host}:{dest_port} failed: {e}. Falling back to Relay.")
 
-    # Strict Delivery Token (No user_id fallback leakage)
-    if contact and contact["delivery_token"]:
-        recipient_delivery_token = contact["delivery_token"]
-    else:
-        # Generate fresh 32-byte cryptographically secure token fallback
-        recipient_delivery_token = b64e(secrets.token_bytes(32))
+    # Deliverable Token Fallback to recipient_id if no token exists yet
+    recipient_delivery_token = contact["delivery_token"] if (contact and contact["delivery_token"]) else recipient_id
 
     if relay_writer_stream and not relay_writer_stream.is_closing():
         try:
@@ -273,18 +293,7 @@ async def start_relay_client_worker():
                     relay_writer_stream = writer
 
                     # Register current 32-byte delivery token
-                    reg_payload = json.dumps({"type": "register_token", "delivery_token": my_delivery_token}).encode("utf-8")
-                    reg_len = len(reg_payload)
-                    reg_hdr = bytearray([0x81])
-                    reg_mask = secrets.token_bytes(4)
-                    if reg_len < 126: reg_hdr.append(0x80 | reg_len)
-                    else: reg_hdr.extend([0x80 | 126] + list(reg_len.to_bytes(2, "big")))
-                    reg_hdr.extend(reg_mask)
-                    reg_masked = bytearray(reg_len)
-                    for i in range(reg_len): reg_masked[i] = reg_payload[i] ^ reg_mask[i % 4]
-                    
-                    writer.write(reg_hdr + reg_masked)
-                    await writer.drain()
+                    await register_delivery_token_on_relay(my_delivery_token)
 
                     while not reader.at_eof():
                         head = await reader.read(2)
@@ -372,7 +381,7 @@ def unlock_vault_session(passphrase: str) -> bool:
             f.write(salt + verification_ct)
         VAULT_MASTER_KEY = derived_key
         logger.info("[Vault] Created new vault.meta with persistent salt.")
-        True
+        return True
 
 def lock_vault_session():
     global VAULT_MASTER_KEY
@@ -558,7 +567,7 @@ def api_create_identity(req: CreateIdentityReq):
     spk_sig = sign_sk.sign(bytes(spk_pk)).signature
 
     user_id = b64e(hashlib.sha256(bytes(sign_pk)).digest()[:16])
-    delivery_token = b64e(secrets.token_bytes(32)) # Cryptographic 32-byte token
+    delivery_token = b64e(secrets.token_bytes(32))
 
     enc_sign_sk = vault_encrypt(b64e(bytes(sign_sk)))
     enc_dh_sk   = vault_encrypt(b64e(bytes(dh_sk)))
@@ -623,7 +632,7 @@ def api_get_contacts():
 
 @app.post("/contacts")
 def api_add_contact(req: AddContactReq):
-    token = req.delivery_token or b64e(secrets.token_bytes(32))
+    token = req.delivery_token or req.user_id
     with get_db(CONTACTS_DB) as db:
         db.execute(
             """INSERT OR REPLACE INTO contacts (user_id, display_name, sign_pk, dh_pk, spk_pk, spk_sig, delivery_token, host, port, added_at)
@@ -775,10 +784,11 @@ async def api_send_message(req: SendMsgReq):
     header, ciphertext_b64 = ratchet_encrypt(st, json.dumps(inner_payload_dict))
     save_ratchet_session(req.conversation_id, st)
 
-    # Rotate local identity delivery token in DB
+    # Rotate local identity delivery token in DB and re-register on active Relay WebSocket stream
     with get_db(KEYS_DB) as db:
         db.execute("UPDATE identity SET delivery_token=? WHERE id=1", (my_next_token,))
         db.commit()
+    await register_delivery_token_on_relay(my_next_token)
 
     payload_b64 = b64e(json.dumps({"header": header, "ct": ciphertext_b64}).encode())
     enc_content = vault_encrypt(req.content)
