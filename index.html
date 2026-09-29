@@ -184,8 +184,10 @@ body { background: var(--bg-dark); color: var(--text-main); height: 100vh; displ
   <div class="modal-box">
     <div class="modal-title">Dein E2EE Profil & Netzwerkeinstellungen</div>
     <div style="font-size:12px; color:var(--accent-cyan); word-break:break-all;" id="profile-user-id">User ID: ...</div>
+    <div style="font-size:12px; color:var(--text-muted); word-break:break-all;" id="profile-dh-pk">DH Public Key: ...</div>
     <div style="font-size:12px; color:var(--text-muted); word-break:break-all;" id="profile-fingerprint">Fingerprint: ...</div>
-    
+    <button class="input-field" style="cursor:pointer; font-size:12px;" onclick="copyProfileShareInfo()">📋 User ID + DH Public Key kopieren</button>
+
     <hr style="border:none; border-top:1px solid var(--border-glass); margin:4px 0;"/>
 
     <!-- SOCKS5 / Tor Settings Section (Goal 1) -->
@@ -349,6 +351,7 @@ async function loadAppContent() {
   document.getElementById('user-name').innerText = activeIdentity.display_name || activeIdentity.user_id.substring(0, 8);
   document.getElementById('user-avatar').innerText = (activeIdentity.display_name || 'U')[0].toUpperCase();
   document.getElementById('profile-user-id').innerText = "User ID: " + activeIdentity.user_id;
+  document.getElementById('profile-dh-pk').innerText = "DH Public Key: " + activeIdentity.dh_pk;
 
   const fp = await window.messenger.getFingerprint();
   if (fp) {
@@ -499,6 +502,13 @@ async function handleP2PUpgrade() {
     btn.disabled = false;
     btn.innerText = '🔗 Direktverbindung';
   }
+}
+
+function copyProfileShareInfo() {
+  if (!activeIdentity) return;
+  const text = `User ID: ${activeIdentity.user_id}\nDH Public Key: ${activeIdentity.dh_pk}`;
+  navigator.clipboard.writeText(text);
+  alert('User ID + DH Public Key in die Zwischenablage kopiert! Diese Daten kannst du gefahrlos teilen (z. B. per E-Mail), um kontaktiert zu werden.');
 }
 
 // ─── Help / Explanations Modal ────────────────────────────────────────────────
