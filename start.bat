@@ -12,7 +12,7 @@ if errorlevel 1 (
 )
 
 echo [1/2] Pruefe Python-Abhaengigkeiten...
-python -c "import nacl, fastapi, uvicorn, pydantic" >nul 2>nul
+python -c "import nacl, fastapi, uvicorn, pydantic, websockets" >nul 2>nul
 if errorlevel 1 (
     echo Abhaengigkeiten fehlen, installiere aus requirements.txt...
     python -m pip install -r requirements.txt
