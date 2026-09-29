@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo === Privacy Messenger: Backend + Frontend Start ===
+echo === Privacy Messenger: Start ===
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -11,13 +11,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/2] Starte Backend (FastAPI)...
-start "Privacy Messenger Backend" cmd /k "cd /d "%~dp0backend" && python server.py"
+echo [1/2] Pruefe Python-Abhaengigkeiten...
+python -c "import nacl, fastapi, uvicorn, pydantic" >nul 2>nul
+if errorlevel 1 (
+    echo Abhaengigkeiten fehlen, installiere aus requirements.txt...
+    python -m pip install -r requirements.txt
+)
 
-echo Warte auf Backend-Start...
-timeout /t 3 /nobreak >nul
+rem Wichtig: Das Backend wird NICHT hier separat gestartet.
+rem Electron (main.js) startet das Python-Backend selbst und uebergibt ihm
+rem automatisch ein passendes API-Token. Ein zusaetzlicher, hier gestarteter
+rem Backend-Prozess wuerde ein ANDERES Token verwenden und alle Anfragen des
+rem Frontends (inkl. Tresor-Entsperren) mit 403 Access Denied fehlschlagen lassen.
 
-echo [2/2] Starte Electron-Frontend...
+echo [2/2] Starte Privacy Messenger (Electron startet das Backend automatisch)...
 if not exist "node_modules" (
     echo node_modules fehlt, fuehre npm install aus...
     call npm install
