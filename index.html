@@ -288,6 +288,17 @@ body { background: var(--bg-dark); color: var(--text-main); height: 100vh; displ
       </div>
     </div>
 
+    <div class="help-item">
+      <div class="help-term">🔌✕ Direktadresse entfernen</div>
+      <div class="help-desc">
+        Erscheint neben einem Kontakt, wenn dafür eine feste IP-Adresse gespeichert ist. Klicke
+        darauf, wenn diese Adresse nicht mehr erreichbar ist (z. B. alter Rechner, andere
+        Netzwerkkonfiguration) — der Kontakt bleibt bestehen, nur die veraltete Adresse wird
+        gelöscht. Danach laufen Nachrichten automatisch über den Relay-Server statt ständig
+        erfolglos zu versuchen, sich direkt zu verbinden.
+      </div>
+    </div>
+
     <button class="btn-primary" onclick="closeHelpModal()">Schließen</button>
   </div>
 </div>
@@ -403,11 +414,26 @@ async function loadContacts() {
   contacts.forEach(c => {
     const item = document.createElement('div');
     item.className = 'contact-item' + (c.user_id === currentActiveContactId ? ' active' : '');
+    item.style.justifyContent = 'space-between';
     item.onclick = () => selectContact(c);
-    item.innerHTML = `
+
+    const left = document.createElement('div');
+    left.style.cssText = 'display:flex; align-items:center; gap:12px; min-width:0;';
+    left.innerHTML = `
       <div class="user-avatar" style="width:30px; height:30px; font-size:12px;">${(c.display_name||'C')[0]}</div>
-      <div style="font-size:13px; font-weight:600;">${c.display_name || c.user_id.substring(0,8)}</div>
+      <div style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${c.display_name || c.user_id.substring(0,8)}</div>
     `;
+    item.appendChild(left);
+
+    if (c.host || c.udp_host) {
+      const clearBtn = document.createElement('button');
+      clearBtn.innerText = '🔌✕';
+      clearBtn.title = `Direktadresse entfernen (aktuell: ${c.host || c.udp_host})`;
+      clearBtn.style.cssText = 'background:none; border:none; color:var(--text-muted); font-size:12px; cursor:pointer; flex-shrink:0; padding:4px;';
+      clearBtn.onclick = (e) => { e.stopPropagation(); handleClearDirectAddress(c.user_id, c.display_name || c.user_id.substring(0,8)); };
+      item.appendChild(clearBtn);
+    }
+
     listEl.appendChild(item);
   });
 }
@@ -478,6 +504,17 @@ async function handleP2PUpgrade() {
 // ─── Help / Explanations Modal ────────────────────────────────────────────────
 function openHelpModal()  { document.getElementById('help-modal').style.display = 'flex'; }
 function closeHelpModal() { document.getElementById('help-modal').style.display = 'none'; }
+
+// ─── Direct Address Cleanup (stop repeated failed connection attempts) ───────
+async function handleClearDirectAddress(userId, displayName) {
+  if (!confirm(`Gespeicherte Direktadresse für "${displayName}" entfernen?\n\nDer Kontakt selbst bleibt erhalten — nur die hinterlegte IP/Port-Adresse wird gelöscht. Nachrichten laufen danach automatisch über den Relay-Server.`)) return;
+  try {
+    await window.messenger.clearDirectAddress(userId);
+    await loadContacts();
+  } catch (e) {
+    alert('Fehler beim Entfernen der Direktadresse.');
+  }
+}
 
 async function loadMessages(contactId) {
   const msgs = await window.messenger.getMessages(contactId);

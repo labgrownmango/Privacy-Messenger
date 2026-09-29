@@ -692,6 +692,23 @@ def api_delete_contact(user_id: str):
         db.commit()
     return {"ok": True}
 
+@app.post("/contacts/{user_id}/clear-direct-address")
+def api_clear_direct_address(user_id: str):
+    """
+    Clears a contact's manually-set direct host/port (used for LAN/port-forwarded
+    TCP delivery) as well as any hole-punched UDP endpoint. Useful to stop repeated
+    failed connection attempts to a stale/unreachable address logged as noise.
+    """
+    with get_db(CONTACTS_DB) as db:
+        cur = db.execute(
+            "UPDATE contacts SET host=NULL, port=NULL, udp_host=NULL, udp_port=NULL WHERE user_id=?",
+            (user_id,)
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Contact not found")
+    return {"ok": True}
+
 # ─── NAT Traversal: STUN + UDP Hole Punching ──────────────────────────────────
 def _handle_incoming_p2p_signal(signal: dict):
     """

@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('messenger', {
   getContacts:   () => apiFetch('/contacts'),
   addContact:    (data) => apiFetch('/contacts', { method: 'POST', body: JSON.stringify(data) }),
   deleteContact: (id)  => apiFetch(`/contacts/${id}`, { method: 'DELETE' }),
+  clearDirectAddress: (id) => apiFetch(`/contacts/${id}/clear-direct-address`, { method: 'POST' }),
 
   // Groups
   getGroups:         () => apiFetch('/groups'),
