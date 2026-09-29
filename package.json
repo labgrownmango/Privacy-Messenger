@@ -1,0 +1,45 @@
+{
+  "name": "privacy-messenger",
+  "version": "1.0.0",
+  "description": "Privacy-First E2E Encrypted Messenger",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.privacy.messenger",
+    "productName": "Privacy Messenger",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "files": [
+      "**/*",
+      "!node_modules/.cache"
+    ],
+    "extraResources": [
+      {
+        "from": "backend-dist/pm-backend.exe",
+        "to": "pm-backend.exe"
+      }
+    ]
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}

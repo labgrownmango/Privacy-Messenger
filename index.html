@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Privacy Messenger 🔐 — Double Ratchet & Enterprise E2EE</title>
+<style>
+:root {
+  --bg-dark: #0c0e14;
+  --bg-panel: rgba(22, 27, 38, 0.75);
+  --bg-card: rgba(30, 37, 52, 0.6);
+  --accent-cyan: #00f2fe;
+  --accent-blue: #4facfe;
+  --text-main: #e2e8f0;
+  --text-muted: #94a3b8;
+  --border-glass: rgba(255, 255, 255, 0.08);
+  --glass-glow: rgba(0, 242, 254, 0.15);
+  --danger: #ff4d4d;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; user-select: none; }
+body { background: var(--bg-dark); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; background-image: radial-gradient(circle at 50% 0%, rgba(79, 172, 254, 0.12), transparent 70%); }
+
+/* Titlebar */
+.titlebar { height: 38px; background: rgba(12, 14, 20, 0.9); display: flex; justify-content: space-between; align-items: center; padding: 0 14px; border-bottom: 1px solid var(--border-glass); -webkit-app-region: drag; }
+.titlebar-title { font-size: 13px; font-weight: 600; letter-spacing: 0.5px; background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.titlebar-controls { display: flex; gap: 8px; -webkit-app-region: no-drag; }
+.titlebar-btn { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; border: none; }
+.btn-close { background: #ff5f56; }
+.btn-min { background: #ffbd2e; }
+.btn-max { background: #27c93f; }
+
+/* Main App Container */
+.app-container { flex: 1; display: flex; overflow: hidden; position: relative; }
+
+/* Sidebar */
+.sidebar { width: 300px; background: var(--bg-panel); backdrop-filter: blur(16px); border-right: 1px solid var(--border-glass); display: flex; flex-direction: column; }
+.sidebar-header { padding: 16px; border-bottom: 1px solid var(--border-glass); display: flex; justify-content: space-between; align-items: center; }
+.user-badge { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.user-avatar { width: 36px; height: 36px; border-radius: 10px; background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); display: flex; align-items: center; justify-content: center; font-weight: 700; color: #000; font-size: 14px; }
+.user-info { display: flex; flex-direction: column; }
+.user-name { font-weight: 600; font-size: 14px; }
+.user-status { font-size: 11px; color: var(--accent-cyan); }
+
+.contacts-header { padding: 12px 16px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
+.add-btn { background: none; border: none; color: var(--accent-cyan); font-size: 16px; cursor: pointer; }
+
+.contact-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 8px; }
+.contact-item { padding: 10px 12px; border-radius: 10px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; }
+.contact-item:hover { background: rgba(255, 255, 255, 0.04); border-color: var(--border-glass); }
+.contact-item.active { background: rgba(0, 242, 254, 0.08); border-color: rgba(0, 242, 254, 0.3); }
+
+/* Main Chat Area */
+.chat-area { flex: 1; display: flex; flex-direction: column; background: rgba(12, 14, 20, 0.4); }
+.chat-header { height: 60px; padding: 0 20px; border-bottom: 1px solid var(--border-glass); display: flex; align-items: center; justify-content: space-between; background: var(--bg-panel); backdrop-filter: blur(16px); }
+.chat-header-info { display: flex; align-items: center; gap: 12px; }
+
+.chat-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.msg-row { display: flex; flex-direction: column; max-width: 65%; }
+.msg-row.out { align-self: flex-end; align-items: flex-end; }
+.msg-row.in { align-self: flex-start; align-items: flex-start; }
+
+.msg-bubble { padding: 12px 16px; border-radius: 16px; font-size: 14px; line-height: 1.5; word-break: break-word; }
+.msg-row.out .msg-bubble { background: linear-gradient(135deg, #00c6ff, #0072ff); color: #fff; border-bottom-right-radius: 4px; }
+.msg-row.in .msg-bubble { background: var(--bg-card); border: 1px solid var(--border-glass); color: var(--text-main); border-bottom-left-radius: 4px; }
+
+.chat-input-area { padding: 16px; background: var(--bg-panel); border-top: 1px solid var(--border-glass); display: flex; gap: 12px; align-items: center; }
+.chat-input { flex: 1; background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-glass); border-radius: 12px; padding: 12px 16px; color: var(--text-main); font-size: 14px; outline: none; transition: border-color 0.2s; }
+.chat-input:focus { border-color: var(--accent-cyan); }
+.btn-send { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; border: none; border-radius: 12px; padding: 12px 20px; font-weight: 600; cursor: pointer; transition: transform 0.1s; }
+.btn-send:active { transform: scale(0.96); }
+
+/* Overlays / Modals */
+.modal-overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(20px); display: flex; justify-content: center; align-items: center; z-index: 100; opacity: 1; transition: opacity 0.3s; }
+.modal-box { background: #161b26; border: 1px solid var(--border-glass); border-radius: 20px; padding: 28px; width: 440px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+.modal-title { font-size: 18px; font-weight: 700; text-align: center; }
+.input-field { background: rgba(0, 0, 0, 0.4); border: 1px solid var(--border-glass); border-radius: 10px; padding: 12px; color: var(--text-main); outline: none; font-size: 14px; width: 100%; }
+.btn-primary { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue)); color: #000; border: none; border-radius: 10px; padding: 12px; font-weight: 700; cursor: pointer; width: 100%; }
+
+.help-item { padding: 10px 0; border-bottom: 1px solid var(--border-glass); }
+.help-item:last-of-type { border-bottom: none; }
+.help-term { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+.help-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+
+/* Dropzone */
+.drop-overlay { position: absolute; inset: 0; background: rgba(0, 242, 254, 0.15); border: 2px dashed var(--accent-cyan); backdrop-filter: blur(10px); display: none; justify-content: center; align-items: center; font-weight: 700; font-size: 18px; z-index: 50; }
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <div class="titlebar-title">Privacy Messenger 🔐</div>
+  <div class="titlebar-controls">
+    <button class="titlebar-btn btn-min" onclick="window.electronAPI.minimize()"></button>
+    <button class="titlebar-btn btn-max" onclick="window.electronAPI.maximize()"></button>
+    <button class="titlebar-btn btn-close" onclick="window.electronAPI.quit()"></button>
+  </div>
+</div>
+
+<div class="app-container" id="main">
+  <div class="drop-overlay" id="drop-zone">📂 Datei für E2EE Verschlüsselung ablegen</div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <div class="user-badge" onclick="openProfileModal()">
+        <div class="user-avatar" id="user-avatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="user-name">Lade Profil...</div>
+          <div class="user-status" id="user-status">🔒 Sehr sicher (Double Ratchet)</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="contacts-header">
+      <span>Kontakte</span>
+      <div style="display:flex; gap:6px;">
+        <button class="add-btn" onclick="openHelpModal()" title="Hilfe / Erklärungen">❓</button>
+        <button class="add-btn" onclick="openAddContactModal()">➕</button>
+      </div>
+    </div>
+
+    <div class="contact-list" id="contact-list">
+      <!-- Contacts populated via Backend -->
+    </div>
+  </div>
+
+  <!-- Main Chat -->
+  <div class="chat-area">
+    <div class="chat-header">
+      <div class="chat-header-info">
+        <div class="user-avatar" id="chat-target-avatar">👥</div>
+        <div>
+          <div style="font-weight:700; font-size:15px;" id="chat-target-name">Wähle einen Kontakt</div>
+          <div style="font-size:11px; color:var(--text-muted);" id="chat-ratchet-status">Double Ratchet Inaktiv</div>
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span id="p2p-status" style="font-size:11px; color:var(--text-muted);"></span>
+        <button id="p2p-upgrade-btn" style="display:none; background:rgba(0,242,254,0.08); border:1px solid rgba(0,242,254,0.3); color:var(--accent-cyan); border-radius:8px; padding:6px 12px; font-size:12px; font-weight:600; cursor:pointer;" title="Versucht eine direkte Verbindung ohne Umweg über den Relay-Server aufzubauen" onclick="handleP2PUpgrade()">🔗 Direktverbindung</button>
+      </div>
+    </div>
+
+    <div class="chat-messages" id="messages">
+      <div style="text-align:center; color:var(--text-muted); margin-top:40px; font-size:13px;">
+        Wähle einen E2EE-Kontakt auf der linken Seite oder füge einen neuen hinzu.
+      </div>
+    </div>
+
+    <div class="chat-input-area">
+      <input type="text" id="chat-msg-input" class="chat-input" placeholder="Verschlüsselte Nachricht eingeben..." onkeydown="if(event.key==='Enter') sendChatMessage()"/>
+      <button class="btn-send" onclick="sendChatMessage()">Senden 🚀</button>
+    </div>
+  </div>
+</div>
+
+<!-- Vault Lock Screen Overlay -->
+<div class="modal-overlay" id="vault-lock-screen">
+  <div class="modal-box">
+    <div class="modal-title">🔐 Tresor Entsperren</div>
+    <div style="font-size:12px; color:var(--text-muted); text-align:center;">
+      Geben Sie Ihr Master-Passwort / PIN ein, um PBKDF2 Master-Keys im Backend freizuschalten.
+    </div>
+    <input type="password" id="vault-pin-input" class="input-field" placeholder="Master PIN / Passwort" onkeydown="if(event.key==='Enter') handleUnlockVault()"/>
+    <button class="btn-primary" onclick="handleUnlockVault()">Tresor Entsperren</button>
+    <div id="vault-error" style="color:var(--danger); font-size:12px; text-align:center; display:none;">Falsches Passwort / PIN!</div>
+  </div>
+</div>
+
+<!-- Add Contact Modal -->
+<div class="modal-overlay" id="add-contact-modal" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-title">Neuer E2EE Kontakt</div>
+    <input type="text" id="add-name-input" class="input-field" placeholder="1. Name (z.B. Alex)"/>
+    <input type="text" id="add-userid-input" class="input-field" placeholder="2. User ID (b64)"/>
+    <input type="text" id="add-dh-input" class="input-field" placeholder="3. DH Public Key (b64)"/>
+    <button class="btn-primary" onclick="saveNewContact()">Kontakt Speichern</button>
+    <button class="input-field" style="cursor:pointer;" onclick="closeAddContactModal()">Abbrechen</button>
+  </div>
+</div>
+
+<!-- Profile & SOCKS5 Proxy Modal -->
+<div class="modal-overlay" id="profile-modal" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-title">Dein E2EE Profil & Netzwerkeinstellungen</div>
+    <div style="font-size:12px; color:var(--accent-cyan); word-break:break-all;" id="profile-user-id">User ID: ...</div>
+    <div style="font-size:12px; color:var(--text-muted); word-break:break-all;" id="profile-fingerprint">Fingerprint: ...</div>
+    
+    <hr style="border:none; border-top:1px solid var(--border-glass); margin:4px 0;"/>
+
+    <!-- SOCKS5 / Tor Settings Section (Goal 1) -->
+    <div style="font-size:13px; font-weight:700; color:var(--accent-blue);">🧅 SOCKS5 / Tor Proxy Routing</div>
+    <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+      <input type="checkbox" id="proxy-enabled-toggle" onchange="toggleProxyUI()"/>
+      <span>Über SOCKS5 Proxy / Tor routen</span>
+    </label>
+    
+    <div id="proxy-fields" style="display:none; flex-direction:column; gap:8px;">
+      <input type="text" id="proxy-host-input" class="input-field" placeholder="Proxy Host (z.B. 127.0.0.1)" value="127.0.0.1"/>
+      <input type="number" id="proxy-port-input" class="input-field" placeholder="Proxy Port (z.B. 9050 für Tor)" value="9050"/>
+      <button class="btn-primary" style="background:linear-gradient(135deg, #00c6ff, #0072ff);" onclick="saveProxySettings()">Proxy Einstellungen Speichern</button>
+    </div>
+
+    <button class="btn-primary" onclick="closeProfileModal()">Schließen</button>
+  </div>
+</div>
+
+<!-- Help / Explanations Modal (for non-technical users) -->
+<div class="modal-overlay" id="help-modal" style="display:none;">
+  <div class="modal-box" style="max-width:520px; max-height:80vh; overflow-y:auto; text-align:left;">
+    <div class="modal-title">❓ Erklärungen</div>
+    <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">
+      Kurze, einfache Erklärungen der wichtigsten Begriffe und Buttons in dieser App.
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">🔗 „Direktverbindung“-Button</div>
+      <div class="help-desc">
+        Versucht, dich direkt mit deinem Kontakt zu verbinden — ohne dass eure Nachrichten
+        über den zwischengeschalteten Relay-Server laufen müssen. Das ist schneller und noch
+        privater. Klappt es nicht (z. B. wegen eines restriktiven Routers), funktioniert der
+        Chat trotzdem ganz normal weiter — nur eben über den Relay-Server als Umweg.
+        Kein Grund zur Sorge, wenn es fehlschlägt.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">🔒 Double Ratchet</div>
+      <div class="help-desc">
+        Das Verschlüsselungsverfahren, das auch Signal/WhatsApp verwenden. Für jede einzelne
+        Nachricht wird ein neuer Schlüssel erzeugt. Selbst wenn ein Schlüssel jemals gestohlen
+        würde, könnten damit weder alte noch zukünftige Nachrichten entschlüsselt werden.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">🧅 SOCKS5 / Tor Proxy</div>
+      <div class="help-desc">
+        Optionale Einstellung im Profil-Menü. Leitet deine Verbindung über das Tor-Netzwerk,
+        damit selbst deine IP-Adresse für Außenstehende schwerer sichtbar ist. Für die normale
+        Nutzung nicht zwingend notwendig.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">📡 Relay-Server</div>
+      <div class="help-desc">
+        Ein Vermittlungsdienst, der eure bereits verschlüsselten Nachrichten weiterleitet, wenn
+        keine Direktverbindung möglich ist. Er kann die Nachrichteninhalte selbst nicht lesen —
+        er sieht nur „verschlüsseltes Paket für Empfänger X“, nicht was drinsteht.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">🗝️ Tresor / Master-Passwort</div>
+      <div class="help-desc">
+        Dein Master-Passwort verschlüsselt alle deine Daten (Schlüssel, Nachrichten) lokal auf
+        deinem Rechner. Ohne dieses Passwort kann niemand — auch nicht du selbst — an die
+        gespeicherten Daten. Es gibt also keine „Passwort vergessen“-Wiederherstellung.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">🆔 User ID & Fingerprint</div>
+      <div class="help-desc">
+        Deine User ID ist deine eindeutige Adresse in der App (wie eine Telefonnummer). Der
+        Fingerprint ist eine kurze Prüfsumme deines Schlüssels — vergleicht ihr den Fingerprint
+        z. B. persönlich oder per Telefon, könnt ihr sicher sein, dass niemand sich dazwischen
+        geschaltet hat (Man-in-the-Middle-Schutz).
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">➕ Kontakt hinzufügen</div>
+      <div class="help-desc">
+        Um jemanden zu kontaktieren, braucht ihr dessen User ID und DH Public Key — beides
+        findet ihr im Profil-Menü der jeweiligen Person. Diese Daten sind nicht geheim, ihr
+        könnt sie z. B. per E-Mail oder QR-Code austauschen.
+      </div>
+    </div>
+
+    <div class="help-item">
+      <div class="help-term">✅ „Sent“ vs. „Queued“</div>
+      <div class="help-desc">
+        „Sent“ heißt: die Nachricht wurde erfolgreich zugestellt oder an den Relay-Server
+        übergeben. „Queued“ heißt: dein Kontakt war gerade offline und keine Verbindung war
+        möglich — sobald er wieder online ist, wird die Nachricht automatisch zugestellt.
+      </div>
+    </div>
+
+    <button class="btn-primary" onclick="closeHelpModal()">Schließen</button>
+  </div>
+</div>
+
+<script>
+let currentActiveContactId = null;
+let activeIdentity = null;
+
+// Initialize App: Enforce Vault Check & Backend Integration
+async function initApp() {
+  try {
+    const vStatus = await window.messenger.getVaultStatus();
+    if (!vStatus.unlocked) {
+      document.getElementById('vault-lock-screen').style.display = 'flex';
+    } else {
+      document.getElementById('vault-lock-screen').style.display = 'none';
+      await loadAppContent();
+    }
+  } catch (err) {
+    console.error('Vault check failed:', err);
+  }
+}
+
+async function handleUnlockVault() {
+  const pin = document.getElementById('vault-pin-input').value;
+  document.getElementById('vault-error').style.display = 'none';
+  if (!pin) return;
+
+  try {
+    const res = await window.messenger.unlockVault(pin);
+    if (res && res.unlocked) {
+      document.getElementById('vault-lock-screen').style.display = 'none';
+      await loadAppContent();
+    } else {
+      document.getElementById('vault-error').style.display = 'block';
+    }
+  } catch (e) {
+    document.getElementById('vault-error').style.display = 'block';
+  }
+}
+
+async function loadAppContent() {
+  let idRes = await window.messenger.getIdentity();
+  if (!idRes.exists) {
+    idRes = await window.messenger.createIdentity("User-" + Math.floor(Math.random()*1000));
+  }
+  activeIdentity = idRes;
+  document.getElementById('user-name').innerText = activeIdentity.display_name || activeIdentity.user_id.substring(0, 8);
+  document.getElementById('user-avatar').innerText = (activeIdentity.display_name || 'U')[0].toUpperCase();
+  document.getElementById('profile-user-id').innerText = "User ID: " + activeIdentity.user_id;
+
+  const fp = await window.messenger.getFingerprint();
+  if (fp) {
+    document.getElementById('profile-fingerprint').innerText = "Fingerprint: SHA-256:" + fp.fingerprint.substring(0, 16).toUpperCase();
+  }
+
+  // Load Proxy Settings
+  await loadProxySettings();
+
+  await loadContacts();
+
+  // Listen to incoming messages via WebSocket
+  window.messenger.connectWS((event) => {
+    if (event.type === 'new_message' && event.message) {
+      if (currentActiveContactId === event.message.conversation_id) {
+        appendMessageUI(event.message.content, false);
+      }
+    }
+  });
+}
+
+// Proxy / Tor Settings Functions
+async function loadProxySettings() {
+  try {
+    const s = await window.messenger.getProxySettings();
+    document.getElementById('proxy-enabled-toggle').checked = s.proxy_enabled || false;
+    document.getElementById('proxy-host-input').value = s.proxy_host || '127.0.0.1';
+    document.getElementById('proxy-port-input').value = s.proxy_port || 9050;
+    toggleProxyUI();
+  } catch (err) {
+    console.warn('Failed to load proxy settings:', err);
+  }
+}
+
+function toggleProxyUI() {
+  const enabled = document.getElementById('proxy-enabled-toggle').checked;
+  document.getElementById('proxy-fields').style.display = enabled ? 'flex' : 'none';
+}
+
+async function saveProxySettings() {
+  const enabled = document.getElementById('proxy-enabled-toggle').checked;
+  const host = document.getElementById('proxy-host-input').value.trim();
+  const port = parseInt(document.getElementById('proxy-port-input').value, 10);
+
+  const res = await window.messenger.setProxySettings({ enabled, host, port });
+  if (res && res.ok) {
+    alert("SOCKS5 Proxy-Einstellungen erfolgreich gespeichert!");
+  } else {
+    alert("Fehler beim Speichern der SOCKS5 Einstellungen!");
+  }
+}
+
+async function loadContacts() {
+  const contacts = await window.messenger.getContacts();
+  const listEl = document.getElementById('contact-list');
+  listEl.innerHTML = '';
+
+  if (contacts.length === 0) {
+    listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:8px;">Keine Kontakte.</div>';
+    return;
+  }
+
+  contacts.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'contact-item' + (c.user_id === currentActiveContactId ? ' active' : '');
+    item.onclick = () => selectContact(c);
+    item.innerHTML = `
+      <div class="user-avatar" style="width:30px; height:30px; font-size:12px;">${(c.display_name||'C')[0]}</div>
+      <div style="font-size:13px; font-weight:600;">${c.display_name || c.user_id.substring(0,8)}</div>
+    `;
+    listEl.appendChild(item);
+  });
+}
+
+async function selectContact(contact) {
+  currentActiveContactId = contact.user_id;
+  document.getElementById('chat-target-name').innerText = contact.display_name || contact.user_id.substring(0, 8);
+
+  await loadContacts();
+  await loadMessages(contact.user_id);
+
+  const rInfo = await window.messenger.getRatchetInfo(contact.user_id);
+  if (rInfo.active) {
+    document.getElementById('chat-ratchet-status').innerText = `Double Ratchet Aktiv (Sent: ${rInfo.ns}, Recv: ${rInfo.nr})`;
+  } else {
+    document.getElementById('chat-ratchet-status').innerText = `Bereit für X3DH Handshake`;
+  }
+
+  // Show the P2P upgrade button once at least one message was exchanged
+  // (a delivery_token is required, which only exists after that point).
+  const p2pBtn = document.getElementById('p2p-upgrade-btn');
+  const p2pStatus = document.getElementById('p2p-status');
+  p2pBtn.style.display = 'inline-block';
+  p2pBtn.disabled = false;
+  p2pBtn.innerText = '🔗 Direktverbindung';
+  if (contact.udp_host && contact.udp_port) {
+    p2pStatus.innerText = '✅ Direktverbunden';
+    p2pStatus.style.color = 'var(--accent-cyan)';
+  } else {
+    p2pStatus.innerText = '';
+  }
+}
+
+// ─── P2P Upgrade (NAT Traversal via STUN / UDP Hole Punching) ────────────────
+async function handleP2PUpgrade() {
+  if (!currentActiveContactId) return;
+  const btn = document.getElementById('p2p-upgrade-btn');
+  const status = document.getElementById('p2p-status');
+
+  btn.disabled = true;
+  btn.innerText = '🔄 Verbinde...';
+  status.style.color = 'var(--text-muted)';
+  status.innerText = 'Suche direkten Weg...';
+
+  try {
+    const res = await window.messenger.p2pUpgrade(currentActiveContactId);
+    if (res && res.ok) {
+      status.style.color = 'var(--accent-cyan)';
+      status.innerText = '✅ Direktverbunden';
+    } else {
+      status.style.color = 'var(--text-muted)';
+      const reasons = {
+        stun_failed: 'Kein Internet / STUN nicht erreichbar',
+        peer_offline_or_no_signal: 'Kontakt gerade nicht online',
+        hole_punch_failed: 'Direktverbindung nicht möglich (Netzwerk zu restriktiv)'
+      };
+      status.innerText = '⚠️ ' + (reasons[res && res.reason] || 'Nicht möglich — läuft weiter über Relay');
+    }
+  } catch (e) {
+    status.style.color = 'var(--danger)';
+    status.innerText = '⚠️ Fehler beim Verbindungsaufbau';
+  } finally {
+    btn.disabled = false;
+    btn.innerText = '🔗 Direktverbindung';
+  }
+}
+
+// ─── Help / Explanations Modal ────────────────────────────────────────────────
+function openHelpModal()  { document.getElementById('help-modal').style.display = 'flex'; }
+function closeHelpModal() { document.getElementById('help-modal').style.display = 'none'; }
+
+async function loadMessages(contactId) {
+  const msgs = await window.messenger.getMessages(contactId);
+  const msgBox = document.getElementById('messages');
+  msgBox.innerHTML = '';
+
+  msgs.forEach(m => {
+    appendMessageUI(m.content, m.is_outgoing === 1);
+  });
+}
+
+function appendMessageUI(content, isOutgoing) {
+  const msgBox = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'msg-row ' + (isOutgoing ? 'out' : 'in');
+  row.innerHTML = `<div class="msg-bubble">${escapeHtml(content)}</div>`;
+  msgBox.appendChild(row);
+  msgBox.scrollTop = msgBox.scrollHeight;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-msg-input');
+  const text = input.value.trim();
+  if (!text || !currentActiveContactId) return;
+
+  await window.messenger.sendMessage({ conversation_id: currentActiveContactId, content: text });
+  appendMessageUI(text, true);
+  input.value = '';
+}
+
+async function saveNewContact() {
+  const name = document.getElementById('add-name-input').value.trim();
+  const uid  = document.getElementById('add-userid-input').value.trim();
+  const dh   = document.getElementById('add-dh-input').value.trim();
+  if (!name || !uid || !dh) return;
+
+  await window.messenger.addContact({ user_id: uid, display_name: name, sign_pk: uid, dh_pk: dh });
+  closeAddContactModal();
+  await loadContacts();
+}
+
+function openProfileModal() { document.getElementById('profile-modal').style.display = 'flex'; }
+function closeProfileModal() { document.getElementById('profile-modal').style.display = 'none'; }
+function openAddContactModal() { document.getElementById('add-contact-modal').style.display = 'flex'; }
+function closeAddContactModal() { document.getElementById('add-contact-modal').style.display = 'none'; }
+
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+window.onload = initApp;
+</script>
+</body>
+</html>
